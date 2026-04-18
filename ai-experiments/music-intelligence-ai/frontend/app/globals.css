@@ -2,39 +2,238 @@
   box-sizing: border-box;
 }
 
+:root {
+  --bg: #f8f9fb;
+  --surface: #ffffff;
+  --text: #111418;
+  --text-muted: #5c6570;
+  --border: #e2e6eb;
+  --accent: #1a56db;
+  --accent-muted: #3b74ee;
+  --error: #b00020;
+  --radius: 12px;
+  --shadow: 0 1px 2px rgba(17, 20, 24, 0.06);
+}
+
 html,
 body {
   margin: 0;
   padding: 0;
-  font-family: system-ui, sans-serif;
-  line-height: 1.4;
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--bg);
 }
 
-main {
-  max-width: 32rem;
+.demo {
+  max-width: 40rem;
   margin: 0 auto;
-  padding: 1.5rem;
+  padding: 2rem 1.5rem 3rem;
 }
 
-button {
-  margin-right: 0.5rem;
-  margin-bottom: 0.5rem;
-  padding: 0.4rem 0.75rem;
+.hero {
+  margin-bottom: 1.75rem;
 }
 
-dl {
-  margin: 1rem 0;
+.hero h1 {
+  margin: 0 0 0.35rem;
+  font-size: 1.65rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
 }
 
-dt {
+.hero-sub {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--text-muted);
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.controls button {
+  margin: 0;
+  padding: 0.5rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  box-shadow: var(--shadow);
+}
+
+.controls button:hover:not(:disabled) {
+  border-color: #cdd3da;
+}
+
+.controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.controls button:first-of-type:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.controls button:first-of-type:not(:disabled):hover {
+  background: var(--accent-muted);
+  border-color: var(--accent-muted);
+}
+
+.status-line {
+  margin: 0 0 0.75rem;
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+.chord-stage {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.75rem 1.5rem;
+  margin-bottom: 1.25rem;
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+.chord-stage-label {
+  margin: 0 0 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.chord-stage-value {
+  margin: 0;
+  font-size: clamp(2.75rem, 12vw, 4.25rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+
+.chord-stage-confidence {
+  margin: 0.85rem 0 0;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.details {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.25rem;
+  box-shadow: var(--shadow);
+}
+
+.detail-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+@media (min-width: 480px) {
+  .detail-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem;
+  }
+}
+
+.detail-block {
+  min-width: 0;
+}
+
+.detail-label {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.25rem;
+}
+
+.detail-value {
+  font-size: 1.15rem;
   font-weight: 600;
 }
 
-dd {
-  margin: 0 0 0.75rem 0;
+.history-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+  box-shadow: var(--shadow);
+}
+
+.section-title {
+  margin: 0 0 0.75rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.history-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.history-list li {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem 0.65rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.history-empty {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.meta-footer {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.meta-footer code {
+  font-size: 0.78rem;
+  background: var(--surface);
+  padding: 0.12rem 0.35rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
 }
 
 .error {
-  color: #b00020;
+  color: var(--error);
   white-space: pre-wrap;
+  font-size: 0.9rem;
+  margin: 0 0 1rem;
 }

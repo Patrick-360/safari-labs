@@ -3,7 +3,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Chord stream",
+  title: "Live chord recognition",
+  description: "Real-time chord and key detection from your microphone",
 };
 
 export default function RootLayout({
