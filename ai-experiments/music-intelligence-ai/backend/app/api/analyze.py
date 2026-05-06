@@ -16,6 +16,10 @@ async def analyze_track(
 		default=False,
 		description="When true, include a structured `debug` object for accuracy evaluation",
 	),
+	use_source_separation: bool = Query(
+		default=False,
+		description="When true, attempt optional accompaniment separation for chord/key paths (fallback safe if deps missing)",
+	),
 ) -> AnalyzeResponse:
 	"""
 	Full-song analysis: duration, tempo (BPM), global key + confidence, chord segments.
@@ -31,7 +35,7 @@ async def analyze_track(
 					"message": "No audio bytes were received. Use form field name 'file', or ensure the file is non-empty.",
 				},
 			)
-		payload = run_analysis(audio_bytes, debug=debug)
+		payload = run_analysis(audio_bytes, debug=debug, use_source_separation=use_source_separation)
 		try:
 			return AnalyzeResponse.model_validate(payload)
 		except ValidationError as exc:

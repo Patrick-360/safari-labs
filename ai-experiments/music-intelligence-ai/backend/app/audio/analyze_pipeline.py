@@ -5,23 +5,30 @@ Offline /analyze pipeline (heuristic — not ML transcription):
 2. **Harmonic extraction**: HPSS harmonic stem feeds chord chroma; percussive energy is not used for harmony
    (rhythm uses the full waveform only for beat_track elsewhere).
    Future: optional `source_separation.separate_harmonic_stems()` could replace / blend this step.
-3. **Time–frequency**: CQT chroma on harmonic stem + light temporal smoothing + mean/max blend per window
-   (arpeggio-friendly).
+3. **Time–frequency**: CQT chroma on harmonic stem + light temporal smoothing; per-slot histogram blends
+   mean/max over time plus per-class maxima so staggered chord tones still vote (non-ML arpeggio cue).
+   A low-register CQT chroma track supplies optional **bass_root_hint** (small template bonus only).
 4. **Beats**: librosa.beat_track on full `y` → boundaries for sections / optional timing snap (not mandatory chord grid).
-5. **Chord candidates**: cosine vs sparse **MVP triad + dim/sus** templates; direct template scoring (no heavy key/progression biasing on the sliding grid).
-6. **Timeline**: overlapping sliding windows (sec-tuned) → median + sticky hysteresis → boundaries at evidence transitions → merged segments.
+5. **Chord candidates**: cosine vs **triads + guarded dim/aug/sus2/sus4** templates for file analyze; exotic
+   qualities need strong score + margin vs major/minor or we fall back; sqrt compression still tames single-bin vocals.
+6. **Timeline**: overlapping sliding windows (short sec-tuned window + hop) → light median + sticky hysteresis (vocal-aware; strong margins can override) → boundaries shifted slightly earlier + harmonic cusp refine; beat snap only when already near-grid.
 7. **Key**: whole-track Krumhansl estimate (global); biases scoring softly, never hard-forces.
 8. **Sections**: beat- or time-grid chroma similarity merge + repetition fingerprint.
 9. **Core progression** (frontend): derived from merged runs; excludes passing / low-confidence per client helpers.
 
-Comments in code mark approximations (jazz/hip-hop honesty, etc.).
+**ML hooks** (defaults off in ``app/core/config.py``):
+    Future Demucs/source separation + note transcription + chord classifiers integrate via
+    ``app/ml/*.py``. ``run_analysis`` calls those interfaces so fusion can be layered in later
+    without reshaping the heuristic core; empty fallbacks intentionally preserve today's output.
+
+Heuristic limitations (vocals, rap, dense mixes, etc.) are unchanged until those hooks are fused.
 """
 
 from __future__ import annotations
 
 import io
 import logging
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import librosa
@@ -37,13 +44,16 @@ from app.audio.features import (
 	key_ranked_candidates,
 )
 from app.audio.music_theory import (
+	PITCH_NAMES_SHARP,
 	blend_chroma_mean_max,
 	chord_template_combined_candidates_debug,
 	format_internal_chord_label,
 	likely_passing_segment,
 	pick_chord_with_theory,
 )
-from app.models.chords import _normalize_vector, _validate_chroma, build_analyze_mvp_templates
+from app.models.chords import _normalize_vector, _validate_chroma, build_analyze_heuristic_templates
+from app.core.config import ENABLE_ML_CHORDS, ENABLE_PITCH_TRANSCRIPTION, ENABLE_SOURCE_SEPARATION
+from app.ml import StemBundle, predict_chords_ml, separate_sources, transcribe_pitch
 
 log = logging.getLogger(__name__)
 
@@ -52,30 +62,36 @@ HOP_LENGTH = 512
 ANALYSIS_SR = 22050
 
 # --- /analyze chord path (single tuning block) ---
-CHORD_WINDOW_SEC = 0.22
-CHORD_HOP_SEC = 0.055
-# Odd window length in slots for median label smoothing (smaller → less boundary lag).
-CHORD_LABEL_MEDIAN_SLOTS = 5
-# Moving average chroma along time (frames); lighter than 7-fr to reduce trailing blur.
-CHROMA_TIME_SMOOTH = 5
-# Minimum duration (sec) for a region to act as a stable harmonic “island” in post passes.
-MIN_STABLE_REGION_SEC = 0.26
+# Shorter analysis window + hop → boundaries track harmony changes sooner (offline / median still smooths single-frame noise).
+# Previous long median (5 slots × ~55 ms hop) plus sticky hysteresis noticeably delayed visible changes.
+CHORD_WINDOW_SEC = 0.16
+CHORD_HOP_SEC = 0.042
+# Odd median width: 3 clears isolated slot spikes with less temporal blur than 5.
+CHORD_LABEL_MEDIAN_SLOTS = 3
+# Lighter per-frame chroma smoothing (fewer CQT frames ~23 ms apart at 22050/512 hop).
+CHROMA_TIME_SMOOTH = 3
+# Refine passes: lower floor so we mostly merge only very brief flutter, not brief real changes.
+MIN_STABLE_REGION_SEC = 0.18
 # Single-PC / vocal-heavy chroma gates (L2-normalized peak share = max bin size).
-CHROMA_VOCAL_PEAK_RATIO = 0.54
-CHROMA_VOCAL_PEAK_RATIO_LOOSE = 0.50
-CHROMA_VOCAL_ENTROPY_MAX = 1.22
+CHROMA_VOCAL_PEAK_RATIO = 0.52
+CHROMA_VOCAL_PEAK_RATIO_LOOSE = 0.48
+CHROMA_VOCAL_ENTROPY_MAX = 1.24
 CHROMA_VOCAL_MAX_STRONG_BINS = 2
-CHROMA_TRIAD_COVER_MIN = 0.56
-VOCALChord_SWITCH_MIN_SCORE = 0.50
-VOCALChord_SWITCH_MIN_MARGIN = 0.042
+CHROMA_TRIAD_COVER_MIN = 0.54
+VOCALChord_SWITCH_MIN_SCORE = 0.52
+VOCALChord_SWITCH_MIN_MARGIN = 0.038
 VOCALChord_SWITCH_MIN_STRONG_BINS = 2
+# If true chord change is clear, allow switch even when vocal_heuristic fired.
+VOCAL_STRONG_SWITCH_MIN_BS = 0.56
+VOCAL_STRONG_SWITCH_MIN_MARGIN = 0.10
 CHORD_ANALYZE_MIN_AUDIO_DOT = 0.165
 # Drop quiet CQT bins before chroma aggregation (reduces transient / broad-band bleed — heuristic gate).
 CHROMA_CQT_THRESHOLD = 0.025
 # Key diatonic bias moved to music_theory.key_fit_bonus.
-STICKY_MIN_BEST_SCORE = 0.41
-STICKY_MIN_RAW_MARGIN = 0.032
+STICKY_MIN_BEST_SCORE = 0.39
+STICKY_MIN_RAW_MARGIN = 0.026
 STICKY_CONF_CAP = 0.22
+VOCAL_STICKY_MARGIN_MULT = 1.28
 # Fallback when chroma is very short.
 SEGMENT_SECONDS = 0.35
 # Merge adjacent beat- or time-windows when mean-chroma cosine similarity >= this (fewer, longer sections).
@@ -85,12 +101,12 @@ SECTION_REPEAT_SIM_THRESHOLD = 0.82
 # If chroma alone is marginal, still repeat-label when chord fingerprints align.
 SECTION_REPEAT_CHROMA_LO = 0.76
 SECTION_REPEAT_FP_SIM = 0.58
-# Drop / absorb chord segments shorter than this after refinement (vocal flutter).
-MIN_CHORD_SEGMENT_SEC = 0.28
-# Replace isolated one-beat-wonder labels shorter than this with neighbor harmony.
-SPIKE_ISOLATE_MAX_SEC = 0.52
+# Absorb only very short segments (vocal flutter / clicks), not quarter-note level changes at moderate tempos.
+MIN_CHORD_SEGMENT_SEC = 0.20
+# Replace isolated one-beat-wonder labels shorter than this when sandwiched.
+SPIKE_ISOLATE_MAX_SEC = 0.40
 # Low-confidence segment shorter than this whose chroma matches previous chord → keep previous (melody note).
-SNAP_WEAK_MAX_SEC = 0.62
+SNAP_WEAK_MAX_SEC = 0.50
 SNAP_WEAK_TO_PREV_CHROMA_SIM = 0.88
 # Also snap short segments when marginal confidence is very low even if low_confidence was not pre-flagged.
 SNAP_EXTRA_CONF_THRESHOLD = 0.26
@@ -108,13 +124,26 @@ MAX_SECTION_PREFERRED_SEC = 18.0
 TARGET_PRACTICE_SECTION_SEC = 12.0
 # No-beat fallback: coarse time grid for initial intervals (then chroma-merge as usual).
 EQUAL_TIME_WINDOW_SEC = 10.0
-# Snap segment edges to nearest beat only when very close (avoid dragging every change to grid).
-BEAT_SNAP_MAX_SEC = 0.06
+# Snap segment edges to nearest beat only when boundary and beat already agree (~140 ms).
+BEAT_SNAP_MAX_SEC = 0.14
 # Search ± this many chroma frames around a boundary for strongest harmonic change.
-HARMONIC_CUSP_RADIUS_FRAMES = 6
+HARMONIC_CUSP_RADIUS_FRAMES = 8
 PASSING_MAX_SEGMENT_SEC = 0.48
+# If the same chord label totals this much duration across ≥ PASSING_REPEAT_MIN_COUNT segments,
+# suppress passing tags on tiny sandwich slices — likely a real harmony, not a grace passing sonority.
+PASSING_REPEAT_MIN_TOTAL_DUR_SEC = 0.92
+PASSING_REPEAT_MIN_COUNT = 2
+# Small cosine boost when low-register chroma peak matches template root (does not pick quality alone).
+BASS_TEMPLATE_DOT_BONUS = 0.026
+# Confidence lift when staggered-evidence score is high and triad cover is decent.
+ARPEGGIO_CONF_SCALE = 0.088
 # Heuristic grouping for practice UI: assume 4/4, first detected beat = bar downbeat (not aligned to real meter).
 DEFAULT_BEATS_PER_BAR = 4
+# Mean-heavy chroma blend in sliding windows: de-emphasize single-frame melodic peaks vs sustained harmony.
+CHROMA_BLEND_W_MEAN = 0.64
+CHROMA_BLEND_W_MAX = 0.36
+# Single-run segment boundary blend: slightly earlier than midpoint so a new chord appears sooner (reduces felt lag).
+CHORD_RUN_BOUNDARY_LEFT_BIAS = 0.58
 
 
 def load_audio_bytes(data: bytes, sr: int = ANALYSIS_SR) -> Tuple[np.ndarray, int]:
@@ -162,8 +191,8 @@ def extract_chroma_track(y: np.ndarray, sr: int, use_hpss: bool = True) -> np.nd
 	"""
 	waveform = np.asarray(y, dtype=float)
 	if use_hpss:
-		# Wider harmonic margin → more sustained harmonic energy, less percussive chroma (approximate separation).
-		harmonic, _ = librosa.effects.hpss(waveform, margin=(2.85, 2.05))
+		# Stronger harmonic emphasis vs percussive residual (approximate; not Demucs).
+		harmonic, _ = librosa.effects.hpss(waveform, margin=(3.05, 2.12))
 		waveform = harmonic
 	chroma = librosa.feature.chroma_cqt(
 		y=waveform,
@@ -175,6 +204,41 @@ def extract_chroma_track(y: np.ndarray, sr: int, use_hpss: bool = True) -> np.nd
 	if chroma.shape[0] != CHROMA_BINS:
 		raise ValueError(f"Expected {CHROMA_BINS} chroma bins, got {chroma.shape[0]}.")
 	return chroma
+
+
+def extract_bass_chroma_track(y: np.ndarray, sr: int, use_hpss: bool = True) -> np.ndarray:
+	"""
+	Low-register CQT chroma (same hop_length as main chord chroma) for bass/root hints only.
+	"""
+	waveform = np.asarray(y, dtype=float)
+	if use_hpss:
+		harmonic, _ = librosa.effects.hpss(waveform, margin=(3.05, 2.12))
+		waveform = harmonic
+	bass = librosa.feature.chroma_cqt(
+		y=waveform,
+		sr=sr,
+		hop_length=HOP_LENGTH,
+		norm=2,
+		threshold=float(CHROMA_CQT_THRESHOLD),
+		fmin=librosa.note_to_hz("C1"),
+		n_octaves=5,
+	)
+	if bass.shape[0] != CHROMA_BINS:
+		raise ValueError(f"Expected {CHROMA_BINS} bass chroma bins, got {bass.shape[0]}.")
+	return bass
+
+
+def _align_bass_chroma_to_track(bass_cc: np.ndarray, t_frames: int) -> np.ndarray | None:
+	if bass_cc is None:
+		return None
+	bf = int(bass_cc.shape[1])
+	if bf >= t_frames:
+		return bass_cc[:, :t_frames].astype(np.float32, copy=False)
+	if bf <= 0:
+		return None
+	pad = t_frames - bf
+	out = np.pad(bass_cc.astype(float), ((0, 0), (0, pad)), mode="edge").astype(np.float32, copy=False)
+	return out
 
 
 def _temporal_smooth_chroma(chroma: np.ndarray, width: int) -> np.ndarray:
@@ -193,6 +257,96 @@ def _temporal_smooth_chroma(chroma: np.ndarray, width: int) -> np.ndarray:
 	return (out / norms).astype(np.float32, copy=False)
 
 
+def _chroma_hist_for_matching(chroma_hist: np.ndarray) -> np.ndarray:
+	"""
+	Sqrt compress non-negative chroma mass before L2 norm — tames one-bin vocal dominance a bit
+	while keeping triad structure (heuristic, not robust source separation).
+	"""
+	v = np.maximum(np.asarray(chroma_hist, dtype=float).reshape(-1), 0.0)
+	return np.sqrt(v)
+
+
+def _aggregate_window_chroma_arpeggio(win_slice: np.ndarray) -> Tuple[np.ndarray, float]:
+	"""
+	Compress frame-wise chroma into a 12-bin histogram for cosine templates + temporal spread cue.
+
+	arpeggio_support ≈ high when chord tones peek at different frames (spread) rather than collapsing
+	to a sustained single-vector snapshot.
+	"""
+	if win_slice.size == 0 or win_slice.shape[1] < 1:
+		h = aggregate_chroma(win_slice)
+		return h, 0.0
+	blended = blend_chroma_mean_max(win_slice, w_mean=CHROMA_BLEND_W_MEAN, w_max=CHROMA_BLEND_W_MAX)
+	pc_mean = np.mean(win_slice.astype(float), axis=1)
+	pc_max = np.max(win_slice.astype(float), axis=1)
+	hist = 0.35 * blended + 0.32 * pc_mean + 0.33 * pc_max
+	me = pc_mean / (np.linalg.norm(pc_mean) + 1e-12)
+	xm = pc_max / (np.linalg.norm(pc_max) + 1e-12)
+	align = float(np.clip(np.dot(me, xm), 0.0, 1.0))
+	spread_bins = float(np.sum(pc_max > pc_mean * 1.38 + 1e-12))
+	spread_frac = float(np.clip(spread_bins / 5.25, 0.0, 1.0))
+	arp = float(np.clip(0.56 * (1.0 - align) + 0.44 * spread_frac, 0.0, 1.0))
+	return hist.astype(np.float32, copy=False), arp
+
+
+def _bass_root_hint_pc_for_window(b_win: np.ndarray) -> int | None:
+	if b_win.shape[1] < 1:
+		return None
+	v = blend_chroma_mean_max(b_win, w_mean=0.55, w_max=0.45)
+	v = np.maximum(np.asarray(v, dtype=float).reshape(-1), 0.0)
+	sm = float(np.sum(v))
+	if sm <= 1e-15:
+		return None
+	pc = int(np.argmax(v))
+	if float(np.max(v)) / sm < 0.285:
+		return None
+	return pc
+
+
+_EXOTIC_QUALITIES = frozenset({"dim", "aug", "sus2", "sus4"})
+
+
+def _exotic_quality_thresholds(quality: str) -> Tuple[float, float, float]:
+	"""`(min_cosine, gap_vs_best_simple_pair, gap_vs_second_exotic)`."""
+	if quality == "aug":
+		return (0.546, 0.066, 0.058)
+	if quality == "dim":
+		return (0.522, 0.050, 0.046)
+	if quality == "sus2":
+		return (0.510, 0.040, 0.036)
+	if quality == "sus4":
+		return (0.512, 0.042, 0.036)
+	return (1.0, 10.0, 10.0)
+
+
+def _first_scored_quality(
+	scored: List[Tuple[str, float]],
+	qualities: frozenset[str],
+) -> Tuple[str, float] | None:
+	for n, s in scored:
+		parts = n.split(":")
+		if len(parts) != 2:
+			continue
+		if parts[1] in qualities:
+			return n, float(s)
+	return None
+
+
+def _second_best_excluding(scored: List[Tuple[str, float]], name: str) -> float:
+	alt = [s for n, s in scored if n != name]
+	return float(max(alt)) if alt else 0.0
+
+
+def _internal_root_pitch_class(internal: str) -> int | None:
+	if not internal or internal == "N" or ":" not in internal:
+		return None
+	rs = internal.split(":")[0]
+	try:
+		return int(PITCH_NAMES_SHARP.index(rs))
+	except ValueError:
+		return None
+
+
 def _format_key_label(raw: str) -> str:
 	if raw.endswith(":maj"):
 		return raw.replace(":maj", " major")
@@ -200,8 +354,8 @@ def _format_key_label(raw: str) -> str:
 
 
 def _analysis_chord_templates() -> Dict[str, np.ndarray]:
-	"""MVP template set for /analyze file mode (maj/min + dim/sus only)."""
-	return build_analyze_mvp_templates()
+	"""Analyze file-mode templates: triads + gated dim/aug/sus (+ N); sevenths omitted."""
+	return build_analyze_heuristic_templates()
 
 
 def _sliding_win_hop_frames(sr: int, t_frames: int) -> Tuple[int, int]:
@@ -219,11 +373,11 @@ def _chroma_pc_metrics(chroma_hist: np.ndarray) -> Dict[str, float]:
 	}
 
 
-def _triad_cover_on_template(chroma_hist: np.ndarray, template: np.ndarray) -> float:
-	h = _normalize_vector(_validate_chroma(chroma_hist))
+def _triad_cover_on_unit_vector(chroma_unit: np.ndarray, template: np.ndarray) -> float:
+	"""`chroma_unit` already L2-normalized 12-vector."""
 	tpl = _normalize_vector(_validate_chroma(template))
 	mask = tpl > 1e-6
-	return float(np.sum(h[mask]))
+	return float(np.sum(chroma_unit[mask]))
 
 
 def _vocal_single_note_heuristic(metrics: Dict[str, float]) -> bool:
@@ -254,6 +408,8 @@ def _best_analyze_slot(
 	templates: Dict[str, np.ndarray],
 	*,
 	prev_internal: str | None,
+	arpeggio_support: float = 0.0,
+	bass_root_pc: int | None = None,
 ) -> Tuple[str, str, float, float, float, bool, List[str]]:
 	"""
 	Direct template cosine path for /analyze (keeps labels simple; avoids heavy theory fusion on the grid).
@@ -261,35 +417,79 @@ def _best_analyze_slot(
 	Returns: internal_name, display_label, best_dot, second_dot, confidence, vocal_interference, confidence_reasons
 	"""
 	reasons: List[str] = []
-	chroma_vec = _normalize_vector(_validate_chroma(chroma_hist))
+	raw = _validate_chroma(chroma_hist)
+	comp = _chroma_hist_for_matching(raw)
+	chroma_vec = _normalize_vector(comp)
 	if float(np.linalg.norm(chroma_vec)) < 1e-12:
 		return "N", "N", 0.0, 0.0, 0.0, False, ["empty_chroma"]
 
-	metrics = _chroma_pc_metrics(chroma_hist)
+	metrics = _chroma_pc_metrics(comp)
 	vocal = _vocal_single_note_heuristic(metrics)
 	if vocal:
 		reasons.append("single_pc_or_sparse_chroma")
 
-	scored = _audio_dots_sorted(chroma_hist, templates)
+	scored = _audio_dots_sorted(comp, templates)
 	if not scored:
 		return "N", "N", 0.0, 0.0, 0.0, vocal, reasons + ["no_templates"]
-	best_name, bs = scored[0]
-	ss = float(scored[1][1]) if len(scored) > 1 else 0.0
+
+	simple_pick = _first_scored_quality(scored, frozenset({"maj", "min"}))
+	if simple_pick is None:
+		simple_pick = scored[0]
+
+	sn, sns = simple_pick
+	best_name, bs = sn, sns
+
+	exotic_pick = _first_scored_quality(scored, _EXOTIC_QUALITIES)
+	if exotic_pick is not None:
+		eno, es = exotic_pick
+		exq = eno.split(":")[1]
+		mc_min, gap_simple, gap_2_self = _exotic_quality_thresholds(exq)
+		sec_exo = _second_best_excluding(scored, eno)
+		top_s = float(scored[0][1])
+		sec_top = float(scored[1][1]) if len(scored) > 1 else 0.0
+		list_strong_vocal = (top_s - sec_top) >= VOCAL_STRONG_SWITCH_MIN_MARGIN and top_s >= VOCAL_STRONG_SWITCH_MIN_BS
+
+		evidence_ok = (
+			(not vocal)
+			or list_strong_vocal
+			or metrics["n_strong"] >= 2.499
+			or (arpeggio_support >= 0.38 and (es - sns) >= gap_simple + 0.026)
+		)
+		if evidence_ok and es >= mc_min and (es - sns) >= gap_simple and (es - sec_exo) >= gap_2_self:
+			best_name = eno
+			bs = es
+			reasons.append("exotic_quality_high_conf")
+
+	ss = _second_best_excluding(scored, best_name)
 
 	if bs < CHORD_ANALYZE_MIN_AUDIO_DOT:
 		return "N", "N", bs, ss, 0.0, vocal, reasons + ["weak_audio_dot"]
 
+	if bass_root_pc is not None:
+		rpc = _internal_root_pitch_class(best_name)
+		if rpc is not None and rpc == int(bass_root_pc) % 12:
+			bs = float(min(1.0, bs + BASS_TEMPLATE_DOT_BONUS))
+			reasons.append("bass_root_hint_agrees")
+
 	tpl_best = templates.get(best_name)
-	t_cover = _triad_cover_on_template(chroma_hist, tpl_best) if tpl_best is not None else 0.0
+	t_cover = _triad_cover_on_unit_vector(chroma_vec, tpl_best) if tpl_best is not None else 0.0
+
+	strong_vocal_harmonic_change = (bs - ss) >= VOCAL_STRONG_SWITCH_MIN_MARGIN and bs >= VOCAL_STRONG_SWITCH_MIN_BS
+	if strong_vocal_harmonic_change and vocal:
+		reasons.append("vocal_frame_strong_template_margin")
+
+	vocal_sw_score = float(VOCALChord_SWITCH_MIN_SCORE * (1.07 if metrics["n_strong"] <= 1.001 else 1.0))
+	vocal_sw_margin = float(VOCALChord_SWITCH_MIN_MARGIN * (1.12 if metrics["n_strong"] <= 1.001 else 1.0))
 
 	if (
 		vocal
 		and prev_internal
 		and prev_internal != "N"
 		and best_name != prev_internal
+		and not strong_vocal_harmonic_change
 		and (
-			bs < VOCALChord_SWITCH_MIN_SCORE
-			or (bs - ss) < VOCALChord_SWITCH_MIN_MARGIN
+			bs < vocal_sw_score
+			or (bs - ss) < vocal_sw_margin
 			or metrics["n_strong"] + 1e-9 < VOCALChord_SWITCH_MIN_STRONG_BINS
 			or t_cover + 1e-9 < CHROMA_TRIAD_COVER_MIN
 		)
@@ -312,10 +512,22 @@ def _best_analyze_slot(
 		+ 0.18 * min(1.0, metrics["n_strong"] / 3.0)
 		+ 0.16 * min(1.0, metrics["entropy"] / 2.485)
 	)
+
 	if vocal:
-		conf *= 0.78
+		conf *= 0.695 if metrics["n_strong"] <= 1.001 else 0.780
+	if vocal and metrics["n_strong"] <= 1.001:
+		conf = float(min(conf, 0.40))
 	if "held_prev_weak_harmonic_under_vocal_heuristic" in reasons:
 		conf = min(conf, 0.40)
+
+	if (
+		arpeggio_support >= 0.32
+		and t_cover >= 0.465
+		and not (vocal and metrics["n_strong"] <= 1.001 and not strong_vocal_harmonic_change)
+	):
+		conf = float(min(1.0, conf * (1.0 + ARPEGGIO_CONF_SCALE * min(1.0, float(arpeggio_support)))))
+		reasons.append("arpeggio_temporal_support")
+
 	if bs < CHORD_WEAK_SCORE_CAP:
 		conf = min(conf, (bs / CHORD_WEAK_SCORE_CAP) * 0.95)
 	conf = float(max(0.0, min(1.0, conf)))
@@ -356,11 +568,12 @@ def _apply_nearby_label_stability(confs: List[float], labels: List[str]) -> None
 def _annotate_core_eligibility_inplace(c: Dict[str, Any]) -> None:
 	"""Frontend may omit these segments when building the main progression (additive field)."""
 	dur = float(c["end"]) - float(c["start"])
+	vox = bool(c.get("vocal_interference"))
 	c["exclude_from_core"] = bool(
 		c.get("low_confidence")
 		or c.get("is_passing")
-		or float(c.get("confidence", 0.0)) < 0.13
-		or (bool(c.get("vocal_interference")) and dur < 0.42)
+		or float(c.get("confidence", 0.0)) < 0.16
+		or (vox and dur < 0.55)
 	)
 
 
@@ -387,6 +600,17 @@ def _merge_adjacent_chord_labels(chords: List[Dict[str, Any]]) -> List[Dict[str,
 			tm1 = c.get("template_margin")
 			if tm0 is not None and tm1 is not None:
 				out[-1]["template_margin"] = float(max(float(tm0), float(tm1)))
+			ar0 = out[-1].get("arpeggio_support")
+			ar1 = c.get("arpeggio_support")
+			if ar0 is not None or ar1 is not None:
+				out[-1]["arpeggio_support"] = round(float(max(float(ar0 or 0.0), float(ar1 or 0.0))), 4)
+			bh0, bh1 = out[-1].get("bass_root_hint"), c.get("bass_root_hint")
+			if bh1 is not None and (
+				bh0 is None or float(c.get("confidence", 0.0)) >= float(out[-1].get("confidence", 0.0))
+			):
+				out[-1]["bass_root_hint"] = bh1
+			elif bh0 is None:
+				out[-1]["bass_root_hint"] = bh1
 		else:
 			row = dict(c)
 			row.setdefault("is_passing", False)
@@ -601,6 +825,20 @@ def _annotate_passing_chords(chords: List[Dict[str, Any]]) -> List[Dict[str, Any
 	if not chords:
 		return chords
 	out = [dict(c) for c in chords]
+	cnt_by_lab: Dict[str, int] = {}
+	tot_sec_by_lab: Dict[str, float] = defaultdict(float)
+	for row in out:
+		lab = str(row["label"])
+		if lab == "N":
+			continue
+		cnt_by_lab[lab] = cnt_by_lab.get(lab, 0) + 1
+		tot_sec_by_lab[lab] += float(row["end"]) - float(row["start"])
+	structural_lab = {
+		lab
+		for lab, tot in tot_sec_by_lab.items()
+		if cnt_by_lab.get(lab, 0) >= PASSING_REPEAT_MIN_COUNT and tot >= PASSING_REPEAT_MIN_TOTAL_DUR_SEC
+	}
+
 	for i, row in enumerate(out):
 		if i == 0 or i == len(out) - 1:
 			row["is_passing"] = False
@@ -619,6 +857,8 @@ def _annotate_passing_chords(chords: List[Dict[str, Any]]) -> List[Dict[str, Any
 			conf,
 			max_dur=PASSING_MAX_SEGMENT_SEC,
 		)
+		if is_p and lab in structural_lab:
+			is_p = False
 		row["is_passing"] = bool(is_p)
 		row["chord_role"] = "passing" if is_p else None
 	return out
@@ -632,6 +872,8 @@ def _finalize_chord_confidence_flags(chords: List[Dict[str, Any]]) -> List[Dict[
 		c["confidence"] = round(cf, 4)
 		c.setdefault("is_passing", False)
 		c.setdefault("chord_role", None)
+		if "arpeggio_support" not in c:
+			c["arpeggio_support"] = 0.0
 	return chords
 
 
@@ -1044,7 +1286,7 @@ def _sticky_post_median_slots(
 			continue
 		bs = best_scores[i]
 		raw_m = bs - second_scores[i]
-		mult = 1.55 if vocal_slots and vocal_slots[i] else 1.0
+		mult = VOCAL_STICKY_MARGIN_MULT if vocal_slots and vocal_slots[i] else 1.0
 		weak = bs < STICKY_MIN_BEST_SCORE or raw_m < STICKY_MIN_RAW_MARGIN * mult
 		if weak:
 			out_labels.append(prev)
@@ -1079,6 +1321,7 @@ def chord_timeline_sliding(
 	sr: int,
 	key_raw: str | None = None,
 	*,
+	bass_chroma: Optional[np.ndarray] = None,
 	slot_debug_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
 	"""
@@ -1090,6 +1333,10 @@ def chord_timeline_sliding(
 	t_frames = chroma.shape[1]
 	if t_frames == 0:
 		return []
+
+	bcc: np.ndarray | None = None
+	if bass_chroma is not None:
+		bcc = _align_bass_chroma_to_track(np.asarray(bass_chroma, dtype=float), t_frames)
 
 	win, hop = _sliding_win_hop_frames(sr, t_frames)
 
@@ -1111,17 +1358,27 @@ def chord_timeline_sliding(
 	slot_second: List[float] = []
 	slot_vocal: List[bool] = []
 	slot_reasons: List[List[str]] = []
+	slot_arps: List[float] = []
+	slot_bass_hints: List[int | None] = []
 	prev_internal: str | None = None
 	for s0 in slot_starts:
 		e0 = min(t_frames, s0 + win)
 		if e0 <= s0:
 			e0 = min(s0 + 1, t_frames)
 		win_slice = chroma[:, s0:e0]
-		hist = blend_chroma_mean_max(win_slice) if win_slice.shape[1] >= 1 else aggregate_chroma(win_slice)
+		hist, arp = _aggregate_window_chroma_arpeggio(win_slice)
+		bass_hint: int | None = None
+		if bcc is not None:
+			b_win = bcc[:, s0:e0]
+			bass_hint = _bass_root_hint_pc_for_window(b_win)
+		slot_arps.append(float(arp))
+		slot_bass_hints.append(bass_hint)
 		_internal, label, _bs, _ss, conf, vocal, reasons = _best_analyze_slot(
 			hist,
 			templates,
 			prev_internal=prev_internal,
+			arpeggio_support=arp,
+			bass_root_pc=bass_hint,
 		)
 		if _internal != "N":
 			prev_internal = _internal
@@ -1154,7 +1411,8 @@ def chord_timeline_sliding(
 	def _mid_boundary_frame(left_slot_idx: int, right_slot_idx: int) -> int:
 		left_edge = min(slot_starts[left_slot_idx] + win, t_frames)
 		right_start = slot_starts[right_slot_idx]
-		return int((left_edge + right_start) // 2)
+		wb = float(CHORD_RUN_BOUNDARY_LEFT_BIAS)
+		return int(round(wb * float(left_edge) + (1.0 - wb) * float(right_start)))
 
 	runs: List[Tuple[int, int]] = []
 	a_run = 0
@@ -1183,6 +1441,8 @@ def chord_timeline_sliding(
 			for r in slot_reasons[i]:
 				if r not in rs_union:
 					rs_union.append(r)
+		t_arp = round(float(max(slot_arps[i] for i in br)), 4)
+		bhints = [slot_bass_hints[i] for i in br if slot_bass_hints[i] is not None]
 		row: Dict[str, Any] = {
 			"start": round(float(start_f * HOP_LENGTH / sr), 4),
 			"end": round(min(float(end_f * HOP_LENGTH / sr), duration_sec), 4),
@@ -1192,7 +1452,11 @@ def chord_timeline_sliding(
 			"template_score": t_sc,
 			"template_margin": t_mg,
 			"vocal_interference": bool(vocal_seg),
+			"arpeggio_support": t_arp,
 		}
+		if bhints:
+			cnt = Counter(bhints)
+			row["bass_root_hint"] = int(cnt.most_common(1)[0][0])
 		if rs_union:
 			row["confidence_reasons"] = rs_union[:12]
 		out.append(row)
@@ -1215,14 +1479,19 @@ def chord_timeline_sliding(
 				"CHROMA_TIME_SMOOTH": CHROMA_TIME_SMOOTH,
 				"win_frames": win,
 				"hop_frames": hop,
+				"labels_raw_before_median": slot_labels[sl] if trunc else slot_labels,
 				"labels_raw_template": slot_labels[sl] if trunc else slot_labels,
+				"labels_after_median_before_sticky": filtered[sl] if trunc else filtered,
 				"labels_after_median": filtered[sl] if trunc else filtered,
 				"labels_after_sticky": stable_l[sl] if trunc else stable_l,
 				"slot_start_times_sec": [round(float(s * HOP_LENGTH / sr), 4) for s in slot_starts][sl],
 				"vocal_interference_slots": slot_vocal[sl] if trunc else slot_vocal,
+				"arpeggio_support_slots": [round(float(x), 4) for x in slot_arps][sl] if trunc else [round(float(x), 4) for x in slot_arps],
+				"bass_root_hint_slots": [x for x in slot_bass_hints][sl] if trunc else list(slot_bass_hints),
 				"segment_boundary_times_sec": [round(float(b), 4) for b in sorted(set(bounds))],
 				"slot_count": n_slots,
 				"truncated": trunc,
+				"slot_preprocess_note": "histogram = mean/max blend + temporal max; arpeggio_support from PC spread; sqrt+L2 for template dots",
 			},
 		)
 
@@ -1249,11 +1518,13 @@ def chord_timeline(
 	while start_f < t_frames:
 		end_f = min(start_f + frames_per_seg, t_frames)
 		slice_c = chroma[:, start_f:end_f]
-		hist = blend_chroma_mean_max(slice_c) if slice_c.shape[1] >= 1 else aggregate_chroma(slice_c)
+		hist, arp = _aggregate_window_chroma_arpeggio(slice_c)
 		_internal, label, bs, ss, conf, vocal, reasons = _best_analyze_slot(
 			hist,
 			templates,
 			prev_internal=prev_internal,
+			arpeggio_support=float(arp),
+			bass_root_pc=None,
 		)
 		if _internal != "N":
 			prev_internal = _internal
@@ -1271,6 +1542,7 @@ def chord_timeline(
 			"template_score": round(float(bs), 4),
 			"template_margin": round(float(bs - ss), 4),
 			"vocal_interference": bool(vocal),
+			"arpeggio_support": round(float(arp), 4),
 		}
 		if reasons:
 			row["confidence_reasons"] = list(reasons)[:12]
@@ -1283,6 +1555,8 @@ def chord_timeline(
 			prev_tm = float(out[-1].get("template_margin", 0.0))
 			out[-1]["template_score"] = round(float(max(prev_ts, float(bs))), 4)
 			out[-1]["template_margin"] = round(float(max(prev_tm, float(bs - ss))), 4)
+			pa = float(out[-1].get("arpeggio_support", 0.0))
+			out[-1]["arpeggio_support"] = round(float(max(pa, float(arp))), 4)
 		else:
 			out.append(row)
 		start_f = end_f
@@ -1318,11 +1592,13 @@ def chord_timeline_beat_aligned(
 		if f1 <= f0:
 			continue
 		slice_c = chroma[:, f0:f1]
-		hist = blend_chroma_mean_max(slice_c) if slice_c.shape[1] >= 1 else aggregate_chroma(slice_c)
+		hist, arp = _aggregate_window_chroma_arpeggio(slice_c)
 		_internal, label, bs, ss, conf, vocal, reasons = _best_analyze_slot(
 			hist,
 			templates,
 			prev_internal=prev_internal,
+			arpeggio_support=float(arp),
+			bass_root_pc=None,
 		)
 		if _internal != "N":
 			prev_internal = _internal
@@ -1337,6 +1613,7 @@ def chord_timeline_beat_aligned(
 			"template_score": round(float(bs), 4),
 			"template_margin": round(float(bs - ss), 4),
 			"vocal_interference": bool(vocal),
+			"arpeggio_support": round(float(arp), 4),
 		}
 		if reasons:
 			row["confidence_reasons"] = list(reasons)[:12]
@@ -1349,6 +1626,8 @@ def chord_timeline_beat_aligned(
 			prev_tm = float(out[-1].get("template_margin", 0.0))
 			out[-1]["template_score"] = round(float(max(prev_ts, float(bs))), 4)
 			out[-1]["template_margin"] = round(float(max(prev_tm, float(bs - ss))), 4)
+			pa = float(out[-1].get("arpeggio_support", 0.0))
+			out[-1]["arpeggio_support"] = round(float(max(pa, float(arp))), 4)
 		else:
 			out.append(row)
 	return out
@@ -1447,7 +1726,11 @@ def _build_analyze_debug(
 		if f1 <= f0:
 			f1 = min(f0 + 1, chroma.shape[1])
 		slice_c = chroma[:, f0:f1]
-		hist = blend_chroma_mean_max(slice_c) if slice_c.shape[1] >= 1 else aggregate_chroma(slice_c)
+		hist = (
+			blend_chroma_mean_max(slice_c, w_mean=CHROMA_BLEND_W_MEAN, w_max=CHROMA_BLEND_W_MAX)
+			if slice_c.shape[1] >= 1
+			else aggregate_chroma(slice_c)
+		)
 		cands = chord_template_combined_candidates_debug(
 			hist,
 			templates,
@@ -1486,13 +1769,42 @@ def _build_analyze_debug(
 		)
 
 	return {
-		"version": 2,
+		"version": 3,
 		"chord_timeline_source": chord_source,
+		"analysis_constants": {
+			"CHORD_WINDOW_SEC": CHORD_WINDOW_SEC,
+			"CHORD_HOP_SEC": CHORD_HOP_SEC,
+			"CHORD_LABEL_MEDIAN_SLOTS": CHORD_LABEL_MEDIAN_SLOTS,
+			"CHROMA_TIME_SMOOTH": CHROMA_TIME_SMOOTH,
+			"MIN_CHORD_SEGMENT_SEC": MIN_CHORD_SEGMENT_SEC,
+			"MIN_STABLE_REGION_SEC": MIN_STABLE_REGION_SEC,
+			"BEAT_SNAP_MAX_SEC": BEAT_SNAP_MAX_SEC,
+			"HARMONIC_CUSP_RADIUS_FRAMES": HARMONIC_CUSP_RADIUS_FRAMES,
+			"CHROMA_BLEND_W_MEAN": CHROMA_BLEND_W_MEAN,
+			"CHROMA_BLEND_W_MAX": CHROMA_BLEND_W_MAX,
+			"CHORD_RUN_BOUNDARY_LEFT_BIAS": CHORD_RUN_BOUNDARY_LEFT_BIAS,
+			"template_vocab": "major_minor_triads_plus_N",
+			"chroma_match_preprocess": "per-slot sqrt compress + L2 norm before template dot",
+			"hpss": "librosa.effects.hpss margin (harmonic, percussive) = (3.05, 2.12) in extract_chroma_track",
+		},
 		"key_selected_raw": key_raw,
 		"key_candidates": key_ranked_candidates(aggregate_chroma(chroma), top_k=8),
 		"beat_count": len(beat_times),
 		"beat_times_sample": bt_sample,
 		"beats_truncated": len(beat_times) > len(bt_sample),
+		"segments_sliding_before_refine": [
+			{
+				"start": round(float(c["start"]), 4),
+				"end": round(float(c["end"]), 4),
+				"label": str(c.get("label")),
+				"confidence": round(float(c.get("confidence", 0.0)), 4),
+				"low_confidence": bool(c.get("low_confidence")),
+				"vocal_interference": bool(c.get("vocal_interference")),
+				"template_score": c.get("template_score"),
+				"template_margin": c.get("template_margin"),
+			}
+			for c in chords_pre_refine
+		],
 		"segments_pre_refine_count": len(chords_pre_refine),
 		"segments_after_refinement_count": len(chords_final),
 		"refine_stages": [
@@ -1516,20 +1828,94 @@ def global_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str, float]:
 	return _format_key_label(raw), raw, float(conf)
 
 
-def run_analysis(audio_bytes: bytes, *, debug: bool = False) -> Dict[str, Any]:
+def _tempo_wave_from_stems(stems: StemBundle) -> np.ndarray:
+	"""Prefer full mixture for rhythmic stability; add light drum emphasis once drum stem exists."""
+	mix = np.asarray(stems.full_mix, dtype=np.float32).reshape(-1)
+	if stems.drums is None:
+		return mix
+	dd = np.asarray(stems.drums, dtype=np.float32).reshape(-1)
+	n = min(mix.shape[0], dd.shape[0])
+	if n <= 0:
+		return mix
+	return np.clip(
+		mix[:n].astype(np.float64) + 0.35 * dd[:n].astype(np.float64),
+		-1.0,
+		1.0,
+	).astype(np.float32, copy=False)
+
+
+def _mix_key_audio_from_stems(stems: StemBundle, chord_wave: np.ndarray) -> np.ndarray:
+	"""
+	Key profile from accompaniment + modest bass uplift when isolated bass stem exists.
+	Reuses ``chord_wave`` buffer when no bass stem (avoids duplicate chroma extraction).
+	"""
+	if stems.bass is None:
+		return chord_wave
+	other = chord_wave
+	bs = np.asarray(stems.bass, dtype=np.float32).reshape(-1)
+	n = min(other.shape[0], bs.shape[0])
+	if n <= 0:
+		return chord_wave
+	blended_head = np.clip(
+		other[:n].astype(np.float64) + 0.45 * bs[:n].astype(np.float64),
+		-1.0,
+		1.0,
+	).astype(np.float32, copy=False)
+	if blended_head.shape[0] == other.shape[0]:
+		return blended_head
+	out = np.empty_like(other)
+	out[: blended_head.shape[0]] = blended_head
+	if blended_head.shape[0] < out.shape[0]:
+		out[blended_head.shape[0] :] = other[blended_head.shape[0] :]
+	return out
+
+
+def run_analysis(
+	audio_bytes: bytes,
+	*,
+	debug: bool = False,
+	use_source_separation: bool = False,
+) -> Dict[str, Any]:
 	y, sr = load_audio_bytes(audio_bytes, sr=ANALYSIS_SR)
 	if y.size < sr * 0.2:
 		raise ValueError("Audio is too short for analysis (need at least ~0.2s).")
 
 	duration_sec = float(len(y)) / float(sr)
-	bpm, beat_times = estimate_tempo_and_beats(y, sr)
-	chroma = extract_chroma_track(y, sr, use_hpss=True)
+	separation_requested = bool(use_source_separation) or ENABLE_SOURCE_SEPARATION
+	sep_result = separate_sources(y, sr, enabled=separation_requested)
+	stems = sep_result.stems
+
+	chord_wave = np.asarray(stems.other, dtype=np.float32).reshape(-1)
+	tempo_wave = _tempo_wave_from_stems(stems)
+	key_wave = _mix_key_audio_from_stems(stems, chord_wave)
+
+	bpm, beat_times = estimate_tempo_and_beats(tempo_wave, sr)
+
+	chroma = extract_chroma_track(chord_wave, sr, use_hpss=True)
 	chroma = _temporal_smooth_chroma(chroma, CHROMA_TIME_SMOOTH)
-	key_label, key_raw, key_conf = global_key_from_chroma(chroma)
+	bass_chroma = extract_bass_chroma_track(chord_wave, sr, use_hpss=True)
+	bass_chroma = _temporal_smooth_chroma(bass_chroma, CHROMA_TIME_SMOOTH)
+	if key_wave is chord_wave:
+		chroma_for_key = chroma
+	else:
+		chroma_raw_k = extract_chroma_track(key_wave, sr, use_hpss=True)
+		chroma_for_key = _temporal_smooth_chroma(chroma_raw_k, CHROMA_TIME_SMOOTH)
+	key_label, key_raw, key_conf = global_key_from_chroma(chroma_for_key)
+
+	# --- Pitch / chord ML prelude (still no fusion): uses same stem chord_wave rides on ---
+	note_events = transcribe_pitch(stems.other, sr, enabled=ENABLE_PITCH_TRANSCRIPTION)
+	ml_chords = predict_chords_ml(stems.other, sr, enabled=ENABLE_ML_CHORDS)
+	_ = (note_events, ml_chords)
 
 	chord_source = "sliding"
 	slot_granular: Dict[str, Any] | None = {} if debug else None
-	chords = chord_timeline_sliding(chroma, sr, key_raw=key_raw, slot_debug_out=slot_granular)
+	chords = chord_timeline_sliding(
+		chroma,
+		sr,
+		key_raw=key_raw,
+		bass_chroma=bass_chroma,
+		slot_debug_out=slot_granular,
+	)
 	if not chords:
 		chord_source = "equal_time_grid"
 		chords = chord_timeline(chroma, sr, segment_seconds=SEGMENT_SECONDS, key_raw=key_raw)
@@ -1551,7 +1937,7 @@ def run_analysis(audio_bytes: bytes, *, debug: bool = False) -> Dict[str, Any]:
 	if log.isEnabledFor(logging.DEBUG):
 		mean_cf = float(np.mean([float(c.get("confidence", 0.0)) for c in chords])) if chords else 0.0
 		log.debug(
-			"analyze: duration=%.2fs bpm=%.1f key=%r raw=%r kconf=%.2f segments=%d mean_conf=%.2f",
+			"analyze: duration=%.2fs bpm=%.1f key=%r raw=%r kconf=%.2f segments=%d mean_conf=%.2f sep_backend=%s",
 			duration_sec,
 			bpm,
 			key_label,
@@ -1559,6 +1945,7 @@ def run_analysis(audio_bytes: bytes, *, debug: bool = False) -> Dict[str, Any]:
 			key_conf,
 			len(chords),
 			mean_cf,
+			sep_result.backend,
 		)
 
 	payload: Dict[str, Any] = {
@@ -1574,7 +1961,7 @@ def run_analysis(audio_bytes: bytes, *, debug: bool = False) -> Dict[str, Any]:
 		"rhythm": rhythm,
 	}
 	if debug:
-		payload["debug"] = _build_analyze_debug(
+		dbg = _build_analyze_debug(
 			chords_pre_refine=chords_pre_snapshot,
 			chords_final=chords,
 			chroma=chroma,
@@ -1585,4 +1972,18 @@ def run_analysis(audio_bytes: bytes, *, debug: bool = False) -> Dict[str, Any]:
 			templates=_analysis_chord_templates(),
 			chord_slot_granular=slot_granular,
 		)
+		dbg["source_separation_enabled"] = separation_requested
+		dbg["source_separation_used"] = bool(sep_result.separation_used)
+		dbg["source_separation_backend"] = sep_result.backend
+		dbg["stem_available"] = dict(sep_result.stem_available)
+		dbg["source_separation_warning"] = sep_result.warning
+		dbg["source_separation_requested_client"] = bool(use_source_separation)
+		dbg["source_separation_config_enabled"] = bool(ENABLE_SOURCE_SEPARATION)
+		dbg["audio_routing_note"] = (
+			"chords keyed off stems.other accompaniment path; tempo from full_mix+optional drums; "
+			"global key blends other+bass stem when isolated bass exists."
+		)
+		if sep_result.meta:
+			dbg["source_separation_meta"] = dict(sep_result.meta)
+		payload["debug"] = dbg
 	return payload

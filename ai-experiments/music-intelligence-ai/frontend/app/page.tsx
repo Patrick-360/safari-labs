@@ -13,6 +13,7 @@ import {
   PIANO_GUIDANCE_DISCLAIMER,
 } from "@/lib/practiceGuidance";
 import { buildPracticeParts, practicePartIndexAtTime, type PracticePart } from "@/lib/practiceSections";
+import { chordNotesDisplayForLabel } from "@/lib/chordSpelling";
 import { LiveTranscribeRing } from "@/lib/liveTranscribeRing";
 import {
   mergeLiveTranscribeKey,
@@ -31,7 +32,6 @@ import {
   liveTriadNoteNamesFromLabel,
   transposeChordLabel,
   transposeChordSegment,
-  transposeChordToneLine,
   transposeNotes,
 } from "@/lib/transpose";
 
@@ -497,9 +497,7 @@ function applyTrackSnapshotToDebug(
 
 function chordNotesLine(seg: AnalyzeChordSeg | null | undefined): string {
   if (!seg) return "—";
-  if (seg.practice_hint && seg.practice_hint.trim()) return seg.practice_hint.trim();
-  if (seg.notes?.length) return seg.notes.join(" · ");
-  return "—";
+  return chordNotesDisplayForLabel(seg.label);
 }
 
 /** Playback time → chord segment; tolerates end-of-track and boundary floats. */
@@ -1015,6 +1013,7 @@ export default function Home() {
   const [analyzeResult, setAnalyzeResult] = useState<AnalyzeApiResponse | null>(null);
   const [analyzeLoading, setAnalyzeLoading] = useState(false);
   const [analyzeQueryDebug, setAnalyzeQueryDebug] = useState(false);
+  const [analyzeUseSourceSeparation, setAnalyzeUseSourceSeparation] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
   const [analyzeAudioUrl, setAnalyzeAudioUrl] = useState<string | null>(null);
   const [analyzePlaybackTime, setAnalyzePlaybackTime] = useState(0);
@@ -1214,7 +1213,7 @@ export default function Home() {
     return coreProgression.map((e) => ({
       ...e,
       label: transposeChordLabel(e.label, n),
-      notesLine: transposeChordToneLine(e.notesLine, n),
+      notesLine: chordNotesDisplayForLabel(transposeChordLabel(e.label, n)),
     }));
   }, [coreProgression, displayTransposeSemitones]);
 
@@ -1251,11 +1250,8 @@ export default function Home() {
     if (!nr) return { label: "End of chart", notesLine: "" };
     const n = displayTransposeSemitones;
     if (n === 0) return { label: nr.label, notesLine: nr.notesLine };
-    const segAt = analyzeResult.chords[nr.startSeg];
-    const notesLine = segAt
-      ? chordNotesLine(transposeChordSegment(segAt, n)!)
-      : transposeChordToneLine(nr.notesLine, n);
-    return { label: transposeChordLabel(nr.label, n), notesLine };
+    const tlab = transposeChordLabel(nr.label, n);
+    return { label: tlab, notesLine: chordNotesDisplayForLabel(tlab) };
   }, [analyzeResult, chordRuns, activeChordRunIndex, displayTransposeSemitones]);
 
   const selectedPracticePart = useMemo((): PracticePart | null => {
@@ -2185,7 +2181,10 @@ export default function Home() {
     try {
       const fd = new FormData();
       fd.append("file", analyzeFile);
-      const res = await fetch(`${API_BASE}/analyze?debug=${analyzeQueryDebug ? "true" : "false"}`, {
+      const params = new URLSearchParams();
+      params.set("debug", analyzeQueryDebug ? "true" : "false");
+      params.set("use_source_separation", analyzeUseSourceSeparation ? "true" : "false");
+      const res = await fetch(`${API_BASE}/analyze?${params.toString()}`, {
         method: "POST",
         body: fd,
       });
@@ -2206,7 +2205,7 @@ export default function Home() {
     } finally {
       setAnalyzeLoading(false);
     }
-  }, [analyzeFile, analyzeQueryDebug]);
+  }, [analyzeFile, analyzeQueryDebug, analyzeUseSourceSeparation]);
 
   const syncAnalyzePlaybackFromElement = useCallback(
     (el: HTMLAudioElement) => {
@@ -3333,6 +3332,20 @@ export default function Home() {
             </label>
           </div>
 
+          <div className="analyze-sep-advanced">
+            <label className="muted-hint analyze-debug-api-label">
+              <input
+                type="checkbox"
+                checked={analyzeUseSourceSeparation}
+                onChange={(e) => setAnalyzeUseSourceSeparation(e.target.checked)}
+              />{" "}
+              Try vocal/drum separation for better chords
+            </label>
+            <p className="muted-hint analyze-sep-hint">
+              Slower, experimental, best for songs with vocals. Falls back safely if the separator isn&apos;t installed.
+            </p>
+          </div>
+
           {analyzeLoading ? (
             <div className="analyze-processing" role="status" aria-live="polite" aria-busy="true">
               <div className="analyze-spinner" aria-hidden />
@@ -4004,7 +4017,7 @@ export default function Home() {
                                 {formatTimeSec(run.start)} – {formatTimeSec(run.end)}
                               </span>
                               <span className="analyze-prog-notes">
-                                {transposeChordToneLine(run.notesLine, displayTransposeSemitones)}
+                                {chordNotesDisplayForLabel(transposeChordLabel(run.label, displayTransposeSemitones))}
                               </span>
                             </button>
                           );

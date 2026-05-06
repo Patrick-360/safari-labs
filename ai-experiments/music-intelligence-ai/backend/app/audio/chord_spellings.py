@@ -1,15 +1,16 @@
 """
-Heuristic playable chord spellings for practice (triads in close position spelling, no voicing/inversion).
+Reliable close-position chord spellings for practice UI (not voicings / inversions).
 
-These are simplified theory helpers for beginners—not exact piano voicings or transcriptions.
+Single source of truth for /analyze `notes` + `practice_hint`. Unknown symbols → no fake notes.
 """
 
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-# Match chroma / template roots (sharp names).
 _PC_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+_PC_FLAT = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+
 _ROOT_ALIASES: Dict[str, int] = {
 	"C": 0,
 	"C#": 1,
@@ -31,112 +32,115 @@ _ROOT_ALIASES: Dict[str, int] = {
 }
 
 
-def _pc_name(pc: int) -> str:
-	return _PC_SHARP[pc % 12]
+def _pc_display(pc: int, prefer_flat: bool) -> str:
+	table = _PC_FLAT if prefer_flat else _PC_SHARP
+	return table[int(pc) % 12]
+
+
+def _root_prefers_flat(body: str) -> bool:
+	"""Flat spelling when the root token uses a flat accidental (e.g. Bb, Eb)."""
+	return "b" in body.lower()
+
+
+def _normalize_colon_chord(token: str) -> str | None:
+	"""Turn C:maj / A:min style into plain token (C, Am). Unknown quality → None."""
+	if ":" not in token:
+		return token.strip()
+	root, qual_raw = token.split(":", 1)
+	root, qual_raw = root.strip(), qual_raw.strip()
+	qual = qual_raw.lower()
+	if root not in _ROOT_ALIASES:
+		return None
+	if qual in ("maj", "major") or qual_raw == "M":
+		return root
+	if qual in ("min", "minor", "m"):
+		return f"{root}m"
+	return None
+
+
+def _root_has_sharp(body: str) -> bool:
+	return "#" in body
+
+
+def _prefer_flat_spelling(body: str, intervals: Tuple[int, ...]) -> bool:
+	"""
+	Flat spellings for roots with 'b' (always). For chords with ♭3 / ♭7 family colors,
+	prefer flats when the root is not a sharp-letter token so outputs match C7 → Bb, Cm7 → Eb.
+	Sharp roots (e.g. F#m7) stay in sharp spelling.
+	"""
+	if _root_prefers_flat(body):
+		return True
+	if _root_has_sharp(body):
+		return False
+	if 3 in intervals or 10 in intervals:
+		return True
+	return False
+
+
+def spell_chord_tones(symbol: str) -> List[str]:
+	"""
+	Spell chord tones from a display-style symbol. Slash uses left side only (e.g. C/E → C major).
+	Returns [] for N, empty, or unrecognized.
+	"""
+	if not symbol or not str(symbol).strip():
+		return []
+	raw = str(symbol).strip()
+	if raw.upper() == "N":
+		return []
+
+	chord_side = raw.split("/")[0].strip()
+	core = _normalize_colon_chord(chord_side)
+	if core is None:
+		return []
+
+	cl = core.lower()
+	body: str
+	intervals: Tuple[int, ...]
+
+	if cl.endswith("maj7"):
+		body, intervals = core[:-4], (0, 4, 7, 11)
+	elif cl.endswith("m7b5"):
+		body, intervals = core[:-5], (0, 3, 6, 10)
+	elif cl.endswith("m7"):
+		# Strip literal "m7" (two chars). core[:-3] breaks short roots like "Cm7" → "".
+		body, intervals = core[:-2], (0, 3, 7, 10)
+	elif cl.endswith("sus4"):
+		body, intervals = core[:-4], (0, 5, 7)
+	elif cl.endswith("sus2"):
+		body, intervals = core[:-4], (0, 2, 7)
+	elif cl.endswith("dim"):
+		body, intervals = core[:-3], (0, 3, 6)
+	elif cl.endswith("aug"):
+		body, intervals = core[:-3], (0, 4, 8)
+	elif len(core) > 1 and core.endswith("+") and not core.lower().endswith("aug"):
+		body, intervals = core[:-1], (0, 4, 8)
+	elif len(cl) >= 3 and cl.endswith("maj") and not cl.endswith("maj7"):
+		body, intervals = core[:-3], (0, 4, 7)
+	elif len(core) >= 2 and core.endswith("7") and not cl.endswith("m7") and not cl.endswith("maj7"):
+		body, intervals = core[:-1], (0, 4, 7, 10)
+	elif len(core) > 1 and core.endswith("m") and not cl.endswith("maj"):
+		body, intervals = core[:-1], (0, 3, 7)
+	else:
+		body, intervals = core, (0, 4, 7)
+
+	if body not in _ROOT_ALIASES:
+		return []
+	root_pc = _ROOT_ALIASES[body]
+	prefer_flat = _prefer_flat_spelling(body, intervals)
+	return [_pc_display(root_pc + iv, prefer_flat) for iv in intervals]
 
 
 def playable_triad_notes_and_hint(symbol: str) -> Tuple[List[str], str]:
 	"""
-	Map a display chord symbol to close-position *roots* (no inversion), for practice hints.
+	Map a chord symbol to close-position note names + short hint line for beginners.
 
-	Supports triads, common sevenths, sus2/sus4, dim/aug, and half-diminished (m7b5).
-	Unknown spellings return a generic line — heuristic, not a full fake book.
+	Slash chords: tones follow the chord (left of /); bass for LH is a separate UI concern.
+	Unknown → empty notes and “check by ear” (no invented spellings).
 	"""
-	if not symbol or symbol == "N":
-		return [], "—"
-
-	s = symbol.strip()
-	sl = s.lower()
-
-	if sl.endswith("maj7"):
-		body = s[: -4].strip()
-		if body not in _ROOT_ALIASES:
-			return [], f"Play {symbol} (spelling not automated)"
-		root = _ROOT_ALIASES[body]
-		intervals = (0, 4, 7, 11)
-		notes = [_pc_name(root + iv) for iv in intervals]
-		hint = f"Play {symbol}: {' — '.join(notes)} (major 7 — close guide, any octave)"
-		return notes, hint
-
-	if sl.endswith("m7b5"):
-		body = s[: -5].strip()
-		if body not in _ROOT_ALIASES:
-			return [], f"Play {symbol} (spelling not automated)"
-		root = _ROOT_ALIASES[body]
-		intervals = (0, 3, 6, 10)
-		notes = [_pc_name(root + iv) for iv in intervals]
-		hint = f"Play {symbol}: {' — '.join(notes)} (half-dim 7 — close guide, any octave)"
-		return notes, hint
-
-	if len(sl) >= 3 and sl.endswith("m7") and not sl.endswith("maj7"):
-		body = s[: -2].strip()
-		if body not in _ROOT_ALIASES:
-			return [], f"Play {symbol} (spelling not automated)"
-		root = _ROOT_ALIASES[body]
-		intervals = (0, 3, 7, 10)
-		notes = [_pc_name(root + iv) for iv in intervals]
-		hint = f"Play {symbol}: {' — '.join(notes)} (minor 7 — close guide, any octave)"
-		return notes, hint
-
-	if len(s) >= 2 and s[-1] == "7":
-		body = s[: -1].strip()
-		if body not in _ROOT_ALIASES:
-			return [], f"Play {symbol} (spelling not automated)"
-		root = _ROOT_ALIASES[body]
-		intervals = (0, 4, 7, 10)
-		notes = [_pc_name(root + iv) for iv in intervals]
-		hint = f"Play {symbol}: {' — '.join(notes)} (dominant 7 — close guide, any octave)"
-		return notes, hint
-
-	if sl.endswith("sus4"):
-		body = s[: -4].strip()
-		if body not in _ROOT_ALIASES:
-			return [], f"Play {symbol} (spelling not automated)"
-		root = _ROOT_ALIASES[body]
-		intervals = (0, 5, 7)
-		notes = [_pc_name(root + iv) for iv in intervals]
-		hint = f"Play {symbol}: {' — '.join(notes)} (sus4 — close guide, any octave)"
-		return notes, hint
-
-	if sl.endswith("sus2"):
-		body = s[: -4].strip()
-		if body not in _ROOT_ALIASES:
-			return [], f"Play {symbol} (spelling not automated)"
-		root = _ROOT_ALIASES[body]
-		intervals = (0, 2, 7)
-		notes = [_pc_name(root + iv) for iv in intervals]
-		hint = f"Play {symbol}: {' — '.join(notes)} (sus2 — close guide, any octave)"
-		return notes, hint
-
-	if sl.endswith("dim"):
-		body = s[: -3].strip()
-		if body not in _ROOT_ALIASES:
-			return [], f"Play {symbol} (spelling not automated)"
-		root = _ROOT_ALIASES[body]
-		intervals = (0, 3, 6)
-		notes = [_pc_name(root + iv) for iv in intervals]
-		hint = f"Play {symbol}: {' — '.join(notes)} (diminished triad — close guide, any octave)"
-		return notes, hint
-
-	if sl.endswith("aug") or s.endswith("+"):
-		body = s[: -3].strip() if sl.endswith("aug") else s[: -1].strip()
-		if body not in _ROOT_ALIASES:
-			return [], f"Play {symbol} (spelling not automated)"
-		root = _ROOT_ALIASES[body]
-		intervals = (0, 4, 8)
-		notes = [_pc_name(root + iv) for iv in intervals]
-		hint = f"Play {symbol}: {' — '.join(notes)} (augmented triad — close guide, any octave)"
-		return notes, hint
-
-	is_minor = len(s) > 1 and s.endswith("m") and not s.endswith("maj")
-	root_token = s[:-1] if is_minor else s
-	if root_token not in _ROOT_ALIASES:
-		return [], f"Play {symbol} (spelling not automated)"
-
-	root = _ROOT_ALIASES[root_token]
-	intervals = (0, 3, 7) if is_minor else (0, 4, 7)
-	notes = [_pc_name(root + iv) for iv in intervals]
-	qual = "minor" if is_minor else "major"
-	hint = f"Play {symbol}: {' — '.join(notes)} ({qual} triad — close spelling, any octave)"
-	return notes, hint
-
+	notes = spell_chord_tones(symbol)
+	if not notes:
+		if not symbol or str(symbol).strip().upper() in ("", "N"):
+			return [], "—"
+		return [], "Check this one by ear — unfamiliar or abbreviated symbol."
+	line = " · ".join(notes)
+	return notes, f"{line} (simplified close spelling, any octave; check by ear if unsure)"

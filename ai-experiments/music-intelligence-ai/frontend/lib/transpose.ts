@@ -3,6 +3,8 @@
  * Unknown or non-standard labels are returned unchanged (never throws).
  */
 
+import { playableChordNotesAndHint, spellChordTones } from "./chordSpelling";
+
 const SHARP_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const FLAT_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
 
@@ -19,6 +21,7 @@ export type TransposableChordSegment = {
   label: string;
   notes?: string[];
   practice_hint?: string;
+  bass_root_hint?: number | null;
 };
 
 function parsePitchClass(note: string): { pc: number; preferFlat: boolean } | null {
@@ -122,17 +125,25 @@ export function transposeChordToneLine(line: string, semitones: number): string 
 }
 
 /**
- * Shallow segment for display: transposed label and notes; drops practice_hint when notes exist (regenerate from tones).
+ * Shallow segment for display: transposed label, `notes` and `practice_hint` rebuilt from
+ * playableChordNotesAndHint (same spelling as `label`).
  */
 export function transposeChordSegment<T extends TransposableChordSegment>(seg: T | null | undefined, semitones: number): T | null {
   if (!seg) return null;
   if (!semitones) return seg;
 
+  const label = transposeChordLabel(seg.label, semitones);
+  const { notes, hint } = playableChordNotesAndHint(label);
+  let shiftedBass: number | null | undefined = seg.bass_root_hint;
+  if (typeof shiftedBass === "number" && Number.isFinite(shiftedBass)) {
+    shiftedBass = ((((shiftedBass + semitones) % 12) + 12) % 12);
+  }
   return {
     ...seg,
-    label: transposeChordLabel(seg.label, semitones),
-    notes: seg.notes?.length ? transposeNotes(seg.notes, semitones) : seg.notes,
-    practice_hint: seg.notes?.length ? undefined : seg.practice_hint,
+    label,
+    notes: notes.length ? notes : undefined,
+    practice_hint: hint === "—" ? undefined : hint,
+    ...(seg.bass_root_hint !== undefined ? { bass_root_hint: shiftedBass } : {}),
   };
 }
 
@@ -145,22 +156,6 @@ export function liveTriadNoteNamesFromLabel(label: string | null | undefined): s
   if (!t || t === "N" || t === "n" || t === "—" || t === "-" || t === "Listening..." || t === "--") {
     return null;
   }
-  const head = t.split("/")[0]?.trim() ?? t;
-  let qual: "maj" | "min" | "dim";
-  let rootRaw: string;
-  if (head.length >= 4 && head.endsWith("dim")) {
-    rootRaw = head.slice(0, -3);
-    qual = "dim";
-  } else if (head.length > 1 && head.endsWith("m") && !head.endsWith("maj")) {
-    rootRaw = head.slice(0, -1);
-    qual = "min";
-  } else {
-    rootRaw = head;
-    qual = "maj";
-  }
-  const parsed = parsePitchClass(rootRaw);
-  if (!parsed) return null;
-  const iv = qual === "maj" ? [0, 4, 7] : qual === "min" ? [0, 3, 7] : [0, 3, 6];
-  const names = parsed.preferFlat ? FLAT_NAMES : SHARP_NAMES;
-  return iv.map((off) => names[(parsed.pc + off) % 12]);
+  const tones = spellChordTones(t);
+  return tones.length ? tones : null;
 }

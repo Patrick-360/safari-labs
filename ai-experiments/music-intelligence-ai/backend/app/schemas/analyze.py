@@ -67,6 +67,16 @@ class ChordSegment(BaseModel):
 		None,
 		description="Optional short codes explaining weak confidence (debug / transparency)",
 	)
+	arpeggio_support: float | None = Field(
+		None,
+		description="Temporal spread of chroma peaks in the segment (0–1); higher suggests arpeggiated/split chord tones",
+	)
+	bass_root_hint: int | None = Field(
+		None,
+		ge=0,
+		le=11,
+		description="Heuristic bass pitch-class index (0=C … 11=B) from low-register chroma; small tie-break only",
+	)
 
 
 class BeatTime(BaseModel):

@@ -1,7 +1,9 @@
 /**
  * Heuristic practice copy for Analyze File mode — no API calls, uses existing analysis only.
+ * Chord tones always follow `label` via spellChordTones (never stale API `notes[]`).
  */
 
+import { slashBassNote, spellChordTones } from "./chordSpelling";
 import type { CoreChordEntry } from "./coreProgression";
 import type { PracticePart } from "./practiceSections";
 
@@ -32,7 +34,7 @@ export function chordRootFromLabel(label: string): string | null {
 }
 
 /**
- * Beginner piano layout: LH root (from symbol if possible), RH from notes[] or practice_hint fallback.
+ * Beginner piano layout: LH slash bass when present, else chord root; RH spaced chord tones from symbol.
  */
 export function getSimplePianoHands(seg: GuidableChordSeg | null | undefined): {
   lh: string;
@@ -42,16 +44,16 @@ export function getSimplePianoHands(seg: GuidableChordSeg | null | undefined): {
   if (!seg) {
     return { lh: "—", rh: "—", oneLine: "—" };
   }
+  const bass = slashBassNote(seg.label);
   const rootFromSymbol = chordRootFromLabel(seg.label);
-  const lh =
-    rootFromSymbol ??
-    (seg.notes?.length ? String(seg.notes[0]) : undefined) ??
-    "—";
+  const lh = bass ?? rootFromSymbol ?? "—";
+
+  const tones = spellChordTones(seg.label);
   let rh = "—";
-  if (seg.notes?.length) {
-    rh = seg.notes.join(" - ");
-  } else if (seg.practice_hint?.trim()) {
-    rh = seg.practice_hint.trim();
+  if (tones.length) {
+    rh = tones.join(" - ");
+  } else if (seg.label.trim() && seg.label.trim().toUpperCase() !== "N") {
+    rh = "Check this one by ear";
   }
   const oneLine = rh !== "—" ? `LH: ${lh} | RH: ${rh}` : `LH: ${lh}`;
   return { lh, rh, oneLine };
@@ -71,7 +73,7 @@ export function buildPianoPracticeStepsForPart(
   if (seq.length > 1) {
     const block = seq
       .map((row) => {
-        const lh = chordRootFromLabel(row.label) ?? "?";
+        const lh = slashBassNote(row.label) ?? chordRootFromLabel(row.label) ?? "?";
         const rhRaw = row.toneLine ? row.toneLine.replace(/\s*·\s*/g, "-") : "";
         const rh = rhRaw || "—";
         return `${row.label}: LH ${lh} | RH ${rh}`;
@@ -146,8 +148,8 @@ export function chordSequenceForPart(
 }
 
 function chordToneLine(c: GuidableChordSeg): string {
-  if (c.practice_hint?.trim()) return c.practice_hint.trim();
-  if (c.notes?.length) return c.notes.join("-");
+  const tones = spellChordTones(c.label);
+  if (tones.length) return tones.join("-");
   return "";
 }
 
@@ -202,14 +204,15 @@ export function buildPracticeStepsForPart(
   return steps;
 }
 
-/** Musician-facing line, e.g. "Play: C - E - G" */
+/** Musician-facing line, e.g. "Play: C - E - G", from `label` spelling only. */
 export function formatPlayHint(c: GuidableChordSeg | null | undefined): string {
   if (!c) return "";
-  if (c.notes?.length) {
-    return `Play: ${c.notes.join(" - ")}`;
+  const tones = spellChordTones(c.label);
+  if (tones.length) {
+    return `Play: ${tones.join(" - ")}`;
   }
-  if (c.practice_hint?.trim()) {
-    return `Play: ${c.practice_hint.trim()}`;
+  if (c.label.trim() && c.label.trim().toUpperCase() !== "N") {
+    return "Play: Check this one by ear";
   }
   return "";
 }

@@ -102,11 +102,24 @@ def build_chord_templates(
 
 def build_analyze_mvp_templates() -> Dict[str, np.ndarray]:
 	"""
-	Small template set for /analyze file mode: triads + dim + sus only (no 7ths, aug, m7b5).
-	Keeps user-facing chord symbols simple and playable.
+	Major/minor triads + N only for /analyze.
+
+	Dim/sus were easy to trigger from vocal-heavy or sparse chroma; a small reliable
+	vocabulary beats a larger wrong one. (Live /stream keeps its own template set.)
 	"""
-	t = build_chord_templates(include_sevenths=False, include_extended=True)
-	return {k: v for k, v in t.items() if k == "N" or (":aug" not in k and ":m7b5" not in k)}
+	return build_chord_templates(include_sevenths=False, include_extended=False)
+
+
+def build_analyze_heuristic_templates() -> Dict[str, np.ndarray]:
+	"""
+	/analyze sliding-window heuristic set: majors, minors + dim / aug / sus2 / sus4 + N.
+
+	Seventh chords and half-dim m7b5 stay out — extra ambiguity without clearer evidence.
+	File-mode scoring gates exotic qualities with conservative thresholds before falling back
+	to triadic families (`build_analyze_mvp_templates` behavior when gates fail).
+	"""
+	full = build_chord_templates(include_sevenths=False, include_extended=True)
+	return {k: v for k, v in full.items() if k == "N" or not str(k).endswith(":m7b5")}
 
 
 def chord_score(chroma: np.ndarray, template: np.ndarray) -> float:
