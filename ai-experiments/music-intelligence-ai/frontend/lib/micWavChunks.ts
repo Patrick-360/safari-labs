@@ -8,16 +8,70 @@ export type MicWavChunk = {
   sampleRate: number;
 };
 
+/** Snapshotted MediaStreamTrack fields for Live debug (serializable). */
+export type MicTrackDebugSnapshot = {
+  trackCount: number;
+  label: string;
+  enabled: boolean;
+  muted: boolean;
+  readyState: string;
+  settingsDeviceId: string | undefined;
+  settingsSampleRate: number | undefined;
+  settingsChannelCount: number | undefined;
+  settingsEchoCancellation: boolean | undefined;
+  settingsNoiseSuppression: boolean | undefined;
+  settingsAutoGainControl: boolean | undefined;
+};
+
+function buildTrackSnapshot(stream: MediaStream): MicTrackDebugSnapshot {
+  const tracks = stream.getAudioTracks();
+  const t = tracks[0];
+  const s = t?.getSettings?.() ?? {};
+  return {
+    trackCount: tracks.length,
+    label: t?.label ?? "—",
+    enabled: t?.enabled ?? false,
+    muted: t?.muted ?? false,
+    readyState: t?.readyState != null ? String(t.readyState) : "ended",
+    settingsDeviceId: s.deviceId,
+    settingsSampleRate: s.sampleRate,
+    settingsChannelCount: s.channelCount,
+    settingsEchoCancellation: s.echoCancellation,
+    settingsNoiseSuppression: s.noiseSuppression,
+    settingsAutoGainControl: s.autoGainControl,
+  };
+}
+
 export type StartMicWavChunksOptions = {
   chunkSeconds?: number;
   /** Emit trailing audio on stop only if at least this many seconds remain. */
   tailMinSeconds?: number;
-  onChunk: (chunk: MicWavChunk) => void | Promise<void>;
+  /** When set, requests this capture device (after permission). */
+  deviceId?: string;
+  /**
+   * Multiply mono capture by this factor before enqueueing WAV samples.
+   * Output to speakers stays silent (`gain` node at 0); only analysis path is boosted.
+   * Typical: 1–8. Values outside [1,32] are clamped for safety.
+   */
+  inputBoost?: number;
+  /**
+   * If false, do not build fixed-duration WAV chunks for `onChunk` (rolling-buffer modes only).
+   * Still runs `onMonoFrames` each callback when set.
+   */
+  streamChunks?: boolean;
+  /**
+   * Each ScriptProcessor buffer: boosted mono + sampleRate (for rolling live transcription ring).
+   */
+  onMonoFrames?: (mono: Float32Array, sampleRate: number) => void;
+  onChunk?: (chunk: MicWavChunk) => void | Promise<void>;
   onError?: (err: Error) => void;
   /** Optional trace for live-mode diagnostics (keep quiet in production). */
   onDebug?: (message: string, detail?: Record<string, unknown>) => void;
+  /** Called when the audio track state/settings should be re-read (mute, device, etc.). */
+  onTrackSnapshot?: (snapshot: MicTrackDebugSnapshot) => void;
   /**
    * Low-rate input levels + context state (throttle in the consumer if you drive React state).
+   * `inputPeak` / `inputRms` are pre-boost downmixed mono; boosted* are after gain + clamp to [-1,1].
    */
   onTelemetry?: (info: {
     audioContextState: AudioContextState;
@@ -25,7 +79,18 @@ export type StartMicWavChunksOptions = {
     inputPeak: number;
     inputRms: number;
     inputFrames: number;
+    inputChannels: number;
+    inputBoost: number;
+    boostedPeak: number;
+    boostedRms: number;
+    clippedSamplesInBuffer: number;
+    clippedFractionInBuffer: number;
   }) => void;
+  /**
+   * Fires on every ScriptProcessor callback (cheap — use to prove `onaudioprocess` is running).
+   * Prefer batching to React state in the consumer.
+   */
+  onProcessTick?: (info: { callbackIndex: number }) => void;
   /**
    * Build the capture graph on this context; it will NOT be closed in `stop()`.
    * Create with `new AudioContext()` and call `resume()` in the same user gesture as Start (before awaits).
@@ -79,6 +144,66 @@ function encodeWavPcm16Mono(samples: Int16Array, sampleRate: number): Blob {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
+/** Mono float samples → PCM16 WAV blob (for rolling-window POST). */
+export function encodeFloat32MonoToWav(samples: Float32Array, sampleRate: number): Blob {
+  return encodeWavPcm16Mono(floatTo16BitPCM(samples), sampleRate);
+}
+
+/**
+ * Downmix all `inputBuffer` channels to mono for WAV + level metering.
+ * Some devices expose a stereo stream with signal only on channel 1 — reading only ch0 yields silence.
+ */
+function monoFromInputBuffer(inputBuffer: AudioBuffer): { mono: Float32Array; peak: number; rms: number } {
+  const nCh = inputBuffer.numberOfChannels;
+  const len = inputBuffer.length;
+  const mono = new Float32Array(len);
+  let peak = 0;
+  let sumSq = 0;
+  const denom = Math.max(1, nCh);
+  for (let i = 0; i < len; i++) {
+    let acc = 0;
+    for (let c = 0; c < nCh; c++) {
+      acc += inputBuffer.getChannelData(c)[i];
+    }
+    const v = acc / denom;
+    mono[i] = v;
+    const a = Math.abs(v);
+    if (a > peak) {
+      peak = a;
+    }
+    sumSq += v * v;
+  }
+  const rms = len > 0 ? Math.sqrt(sumSq / len) : 0;
+  return { mono, peak, rms };
+}
+
+/** Apply linear gain for analysis/WAV path; clamp to [-1,1]; count samples that required clamping. */
+function boostMonoForAnalysis(
+  mono: Float32Array,
+  linearGain: number,
+): { boosted: Float32Array; boostedPeak: number; boostedRms: number; clippedSamples: number } {
+  const n = mono.length;
+  const boosted = new Float32Array(n);
+  let boostedPeak = 0;
+  let sumSq = 0;
+  let clippedSamples = 0;
+  for (let i = 0; i < n; i++) {
+    const pre = mono[i] * linearGain;
+    if (pre > 1 || pre < -1) {
+      clippedSamples += 1;
+    }
+    const v = Math.max(-1, Math.min(1, pre));
+    boosted[i] = v;
+    const a = Math.abs(v);
+    if (a > boostedPeak) {
+      boostedPeak = a;
+    }
+    sumSq += v * v;
+  }
+  const boostedRms = n > 0 ? Math.sqrt(sumSq / n) : 0;
+  return { boosted, boostedPeak, boostedRms, clippedSamples };
+}
+
 function takeSamples(queue: Float32Array[], count: number): Float32Array {
   const out = new Float32Array(count);
   let written = 0;
@@ -116,6 +241,16 @@ function resolveAudioContext(): typeof AudioContext {
   );
 }
 
+function processorInputChannelCount(stream: MediaStream): number {
+  const t = stream.getAudioTracks()[0];
+  const n = t?.getSettings?.().channelCount;
+  if (typeof n === "number" && n >= 1) {
+    return Math.min(8, Math.max(2, n));
+  }
+  /** Stereo-safe default: ch0-only ScriptProcessors often see silence when hardware uses ch1. */
+  return 2;
+}
+
 /**
  * Opens the mic and calls `onChunk` with WAV blobs (~`chunkSeconds` each).
  * Tear down with `stop()` on the returned handle.
@@ -125,7 +260,21 @@ export async function startMicWavChunks(
 ): Promise<{ stop: () => Promise<void> }> {
   const chunkSeconds = options.chunkSeconds ?? 2;
   const tailMinSeconds = options.tailMinSeconds ?? 0.2;
-  const { onChunk, onError, onDebug, onTelemetry, audioContext: providedCtx } = options;
+  const {
+    onChunk,
+    onError,
+    onDebug,
+    onTelemetry,
+    onProcessTick,
+    onTrackSnapshot,
+    onMonoFrames,
+    audioContext: providedCtx,
+    deviceId,
+    inputBoost: requestedBoost,
+    streamChunks: streamChunksOpt = true,
+  } = options;
+  const streamChunks = streamChunksOpt !== false;
+  const inputBoost = Math.min(32, Math.max(1, requestedBoost ?? 1));
   const ownsAudioContext = providedCtx == null;
 
   /**
@@ -150,14 +299,33 @@ export async function startMicWavChunks(
     onDebug?.("audio_context_reused", { state: audioCtx.state, sampleRate: audioCtx.sampleRate });
   }
 
+  const audioConstraints: MediaTrackConstraints = {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+  };
+  if (deviceId) {
+    audioConstraints.deviceId = { ideal: deviceId };
+  }
+
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
-    },
+    audio: audioConstraints,
   });
-  onDebug?.("get_user_media_ok", { trackCount: stream.getTracks().length });
+
+  const audioTracks = stream.getAudioTracks();
+  for (const tr of audioTracks) {
+    tr.enabled = true;
+  }
+
+  const pushTrackSnapshot = () => onTrackSnapshot?.(buildTrackSnapshot(stream));
+  pushTrackSnapshot();
+  for (const tr of audioTracks) {
+    tr.addEventListener("mute", pushTrackSnapshot);
+    tr.addEventListener("unmute", pushTrackSnapshot);
+    tr.addEventListener("ended", pushTrackSnapshot);
+  }
+
+  onDebug?.("get_user_media_ok", { ...buildTrackSnapshot(stream) });
 
   if (audioCtx.state === "suspended") {
     await audioCtx.resume();
@@ -165,9 +333,13 @@ export async function startMicWavChunks(
   }
 
   const source = audioCtx.createMediaStreamSource(stream);
-  const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  const inCh = processorInputChannelCount(stream);
+  const processor = audioCtx.createScriptProcessor(4096, inCh, 1);
   const gain = audioCtx.createGain();
   gain.gain.value = 0;
+
+  /** Hold references until stop() so the graph is not GC'd mid-capture. */
+  const keepAlive = { source, processor, gain, stream };
 
   const pending: Float32Array[] = [];
   const chunkSamples = Math.floor(audioCtx.sampleRate * chunkSeconds);
@@ -175,49 +347,85 @@ export async function startMicWavChunks(
   const emitChunk = (samples: Float32Array, sampleRate: number) => {
     const pcm = floatTo16BitPCM(samples);
     const blob = encodeWavPcm16Mono(pcm, sampleRate);
-    return Promise.resolve(onChunk({ blob, sampleRate }));
+    return onChunk ? Promise.resolve(onChunk({ blob, sampleRate })) : Promise.resolve();
   };
 
   let processCbCount = 0;
   processor.onaudioprocess = (event) => {
     try {
       processCbCount += 1;
-      const input = event.inputBuffer.getChannelData(0);
-      let peak = 0;
-      let sumSq = 0;
-      for (let i = 0; i < input.length; i++) {
-        const v = input[i];
-        const a = Math.abs(v);
-        if (a > peak) peak = a;
-        sumSq += v * v;
-      }
-      const rms = input.length > 0 ? Math.sqrt(sumSq / input.length) : 0;
+      onProcessTick?.({ callbackIndex: processCbCount });
+
+      const ib = event.inputBuffer;
+      const { mono, peak, rms } = monoFromInputBuffer(ib);
+      const { boosted, boostedPeak, boostedRms, clippedSamples } = boostMonoForAnalysis(mono, inputBoost);
+      const clippedFractionInBuffer = mono.length > 0 ? clippedSamples / mono.length : 0;
+
+      const out = event.outputBuffer.getChannelData(0);
+      out.fill(0);
+
       if (processCbCount <= 3 || processCbCount % 24 === 0) {
         onTelemetry?.({
           audioContextState: audioCtx.state,
           callbackIndex: processCbCount,
           inputPeak: peak,
           inputRms: rms,
-          inputFrames: input.length,
+          inputFrames: ib.length,
+          inputChannels: ib.numberOfChannels,
+          inputBoost,
+          boostedPeak,
+          boostedRms,
+          clippedSamplesInBuffer: clippedSamples,
+          clippedFractionInBuffer,
         });
       }
       if (processCbCount === 1) {
-        onDebug?.("first_onaudioprocess", { state: audioCtx.state, frames: event.inputBuffer.length, peak, rms });
+        const perChPeak: number[] = [];
+        for (let c = 0; c < ib.numberOfChannels; c++) {
+          const ch = ib.getChannelData(c);
+          let pc = 0;
+          for (let i = 0; i < ch.length; i++) {
+            const a = Math.abs(ch[i]);
+            if (a > pc) {
+              pc = a;
+            }
+          }
+          perChPeak.push(pc);
+        }
+        onDebug?.("first_onaudioprocess", {
+          state: audioCtx.state,
+          frames: ib.length,
+          inputChannels: ib.numberOfChannels,
+          processorInputChannels: inCh,
+          peakDownmix: peak,
+          rmsDownmix: rms,
+          inputBoost,
+          boostedPeak,
+          boostedRms,
+          clippedFractionInBuffer,
+          perChannelPeak: perChPeak,
+        });
       }
+
       if (audioCtx.state === "suspended") {
         void audioCtx.resume();
       }
-      const copy = new Float32Array(input.length);
-      copy.set(input);
-      pending.push(copy);
 
-      while (queuedSampleCount(pending) >= chunkSamples) {
-        const merged = takeSamples(pending, chunkSamples);
-        onDebug?.("chunk_ready", { samples: merged.length, sampleRate: audioCtx.sampleRate });
-        void emitChunk(merged, audioCtx.sampleRate).catch((e) => {
-          const err = e instanceof Error ? e : new Error(String(e));
-          onError?.(err);
-        });
+      const copy = new Float32Array(boosted.length);
+      copy.set(boosted);
+      onMonoFrames?.(new Float32Array(copy), audioCtx.sampleRate);
+
+      if (streamChunks) {
+        pending.push(copy);
+
+        while (queuedSampleCount(pending) >= chunkSamples) {
+          const merged = takeSamples(pending, chunkSamples);
+          onDebug?.("chunk_ready", { samples: merged.length, sampleRate: audioCtx.sampleRate });
+          void emitChunk(merged, audioCtx.sampleRate).catch((e) => {
+            const err = e instanceof Error ? e : new Error(String(e));
+            onError?.(err);
+          });
+        }
       }
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
@@ -225,10 +433,16 @@ export async function startMicWavChunks(
     }
   };
 
-  source.connect(processor);
-  processor.connect(gain);
-  gain.connect(audioCtx.destination);
-  onDebug?.("graph_connected", { state: audioCtx.state, chunkSamples, chunkSeconds });
+  keepAlive.source.connect(keepAlive.processor);
+  keepAlive.processor.connect(keepAlive.gain);
+  keepAlive.gain.connect(audioCtx.destination);
+  onDebug?.("graph_connected", {
+    state: audioCtx.state,
+    chunkSamples,
+    chunkSeconds,
+    scriptProcessorInputChannels: inCh,
+    inputBoost,
+  });
 
   const onVisibility = () => {
     if (!document.hidden && audioCtx.state === "suspended") {
@@ -241,16 +455,22 @@ export async function startMicWavChunks(
   return {
     stop: async () => {
       document.removeEventListener("visibilitychange", onVisibility);
-      processor.onaudioprocess = null;
-      processor.disconnect();
-      gain.disconnect();
-      source.disconnect();
-      stream.getTracks().forEach((t) => t.stop());
+      for (const tr of audioTracks) {
+        tr.removeEventListener("mute", pushTrackSnapshot);
+        tr.removeEventListener("unmute", pushTrackSnapshot);
+        tr.removeEventListener("ended", pushTrackSnapshot);
+      }
+
+      keepAlive.processor.onaudioprocess = null;
+      keepAlive.processor.disconnect();
+      keepAlive.gain.disconnect();
+      keepAlive.source.disconnect();
+      keepAlive.stream.getTracks().forEach((t) => t.stop());
 
       const sampleRate = audioCtx.sampleRate;
       const remaining = queuedSampleCount(pending);
       const minFlush = Math.floor(sampleRate * tailMinSeconds);
-      if (remaining >= minFlush) {
+      if (streamChunks && onChunk && remaining >= minFlush) {
         const merged = takeSamples(pending, remaining);
         await emitChunk(merged, sampleRate);
       } else {

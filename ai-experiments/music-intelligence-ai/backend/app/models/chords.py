@@ -100,6 +100,15 @@ def build_chord_templates(
 	return templates
 
 
+def build_analyze_mvp_templates() -> Dict[str, np.ndarray]:
+	"""
+	Small template set for /analyze file mode: triads + dim + sus only (no 7ths, aug, m7b5).
+	Keeps user-facing chord symbols simple and playable.
+	"""
+	t = build_chord_templates(include_sevenths=False, include_extended=True)
+	return {k: v for k, v in t.items() if k == "N" or (":aug" not in k and ":m7b5" not in k)}
+
+
 def chord_score(chroma: np.ndarray, template: np.ndarray) -> float:
 	chroma_vec = _normalize_vector(_validate_chroma(chroma))
 	template_vec = _normalize_vector(_validate_chroma(template))

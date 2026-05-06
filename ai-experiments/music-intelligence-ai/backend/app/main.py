@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.analyze import router as analyze_router
+from app.api.live_transcribe import router as live_transcribe_router
 from app.api.stream import router as stream_router
 from app.cors_config import cors_allow_origins
 
@@ -16,6 +17,7 @@ app.add_middleware(
 )
 
 app.include_router(stream_router, prefix="")
+app.include_router(live_transcribe_router, prefix="")
 app.include_router(analyze_router, prefix="")
 
 

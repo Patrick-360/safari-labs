@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { deriveCoreProgression, firstChordTimeForLabel } from "@/lib/coreProgression";
 import {
@@ -13,42 +13,323 @@ import {
   PIANO_GUIDANCE_DISCLAIMER,
 } from "@/lib/practiceGuidance";
 import { buildPracticeParts, practicePartIndexAtTime, type PracticePart } from "@/lib/practiceSections";
-import { startMicWavChunks } from "@/lib/micWavChunks";
+import { LiveTranscribeRing } from "@/lib/liveTranscribeRing";
+import {
+  mergeLiveTranscribeKey,
+  mergeTranscribeTimeline,
+  type LiveTranscribeKey,
+  type TimelineSeg,
+} from "@/lib/liveTranscribeMerge";
+import { deriveFallbackProgressionFromWindowChords, deriveLiveStableProgression } from "@/lib/liveTranscribeProgression";
+import {
+  buildLiveTranscribeSnapshot,
+  copyTextToClipboard,
+  downloadLiveTranscribeSnapshotJson,
+} from "@/lib/liveTranscribeSnapshot";
+import { encodeFloat32MonoToWav, startMicWavChunks, type MicTrackDebugSnapshot } from "@/lib/micWavChunks";
+import {
+  liveTriadNoteNamesFromLabel,
+  transposeChordLabel,
+  transposeChordSegment,
+  transposeChordToneLine,
+  transposeNotes,
+} from "@/lib/transpose";
 
-const CHUNK_SECONDS = 1.0;
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
 
-/** Console + optional panel: env or add <code>?liveDebug=1</code> to the URL. */
-const LIVE_MIC_DEBUG = process.env.NEXT_PUBLIC_LIVE_MIC_DEBUG === "1";
+/** Verbose `[live]` console logs — optional via env or <code>?liveDebug=1</code>. */
+const LIVE_MIC_CONSOLE = process.env.NEXT_PUBLIC_LIVE_MIC_DEBUG === "1";
+
+/** Sent as <code>?mode=…</code> on every POST /stream (live sensitivity preset). */
+type LiveInputMode = "instrument" | "song" | "debug";
+
+const LIVE_INPUT_MODE_OPTIONS: { value: LiveInputMode; label: string; hint: string }[] = [
+  {
+    value: "instrument",
+    label: "Instrument",
+    hint: "Best when you are playing piano or guitar into the mic. Ignores most room noise and chatter.",
+  },
+  {
+    value: "song",
+    label: "Speaker / room",
+    hint: "For a track playing on speakers or a phone in the room. Snappier, but messier than a file upload.",
+  },
+  {
+    value: "debug",
+    label: "Diagnostics",
+    hint: "Looser listening for testing only — not for serious practice.",
+  },
+];
+
+/** Default mic analysis gain when the user has not manually chosen a boost level. */
+const LIVE_BOOST_DEFAULTS: Record<LiveInputMode, number> = {
+  instrument: 1,
+  song: 4,
+  debug: 2,
+};
+
+const LIVE_INPUT_BOOST_OPTIONS: readonly number[] = [1, 2, 4, 8];
+
+/** WAV chunk length for live mic; shorter in song mode for lower latency (still valid WAV for /stream). */
+const LIVE_CHUNK_SECONDS: Record<LiveInputMode, number> = {
+  instrument: 1.0,
+  song: 0.45,
+  debug: 1.0,
+};
+
+/** Top-level live product: instant /stream vs rolling-window transcription. */
+type LiveExperienceMode = "instant" | "transcribe";
+
+/**
+ * Live song transcription timing (tune here).
+ * - FIRST: wait until this much audio is buffered before the first POST (tradeoff: lower = snappier but noisier).
+ * - WINDOW: each request sends up to this many seconds (harmonic context; longer = more stable).
+ * - INTERVAL: how often follow-up POSTs run (tradeoff: lower = fresher UI but more server load; keep < WINDOW so windows overlap).
+ */
+const FIRST_TRANSCRIBE_AFTER_SEC = 5;
+/** Max seconds of audio per analysis request (rolling tail). */
+const TRANSCRIBE_WINDOW_SEC = 12;
+/** Seconds between follow-up analyses while listening. */
+const TRANSCRIBE_INTERVAL_SEC = 8;
+/** Reject analysis if the sliced WAV is shorter than this (avoids random guesses on tiny slices). */
+const MIN_TRANSCRIBE_AUDIO_SEC = 4;
+
+const FIRST_TRANSCRIBE_DELAY_MS = FIRST_TRANSCRIBE_AFTER_SEC * 1000;
+const TRANSCRIBE_INTERVAL_MS = TRANSCRIBE_INTERVAL_SEC * 1000;
+
+/** Ring must hold at least WINDOW; small headroom for scheduling jitter. */
+const TRANSCRIBE_RING_MAX_SEC = 16;
+const TRANSCRIBE_TIMELINE_KEEP_SEC = 32;
+
+type LiveTranscribeApiResponse = {
+  window_start: number;
+  window_end: number;
+  session_id?: string | null;
+  key: { label: string; confidence: number };
+  current_chord: string;
+  chords?: {
+    start: number;
+    end: number;
+    label: string;
+    confidence: number;
+    notes: string[];
+    practice_hint: string;
+    low_confidence: boolean;
+    is_passing?: boolean;
+    chord_role?: string | null;
+  }[];
+  core_progression: { label: string; notes: string[] }[];
+  summary: string;
+  status: "listening" | "analyzing" | "ready";
+  tempo_bpm?: number;
+  progression_meta?: {
+    source?: string;
+    quality?: string;
+    empty_reason?: string | null;
+  };
+  debug?: Record<string, unknown>;
+};
+
+type TranscribeDebugSnapshot = {
+  ringBufferedSec: number;
+  lastWindowSec: number;
+  lastRawPeak: number;
+  lastRawRms: number;
+  lastRequestStatus: string;
+  lastKeyLabel: string;
+  lastProgression: string;
+  lastError: string;
+  analysisCount: number;
+  /** Round-trip time for last completed /live-transcribe request (ms), excluding client prep. */
+  lastRequestDurationMs: number | null;
+  /** Last applied JSON `status` from server (listening / analyzing / ready). */
+  lastAnalysisStatus: string;
+  /** From last response `debug.core_empty_reason` when debug=true */
+  lastLtCoreEmptyReason: string;
+  /** From last response `debug.runs_for_core_strategy` */
+  lastLtRunsForCoreStrategy: string;
+  /** Compact segment counts: total/stable/low from server debug */
+  lastLtServerSegmentSummary: string;
+  /** Echo of optional query client_timeline_seg_count when debug=true */
+  lastLtClientTimelineSegEcho: string;
+  lastProgressionSource: string;
+  lastProgressionQuality: string;
+};
+
+const TRANSCRIBE_DEBUG_INITIAL: TranscribeDebugSnapshot = {
+  ringBufferedSec: 0,
+  lastWindowSec: 0,
+  lastRawPeak: 0,
+  lastRawRms: 0,
+  lastRequestStatus: "—",
+  lastKeyLabel: "—",
+  lastProgression: "—",
+  lastError: "—",
+  analysisCount: 0,
+  lastRequestDurationMs: null,
+  lastAnalysisStatus: "—",
+  lastLtCoreEmptyReason: "—",
+  lastLtRunsForCoreStrategy: "—",
+  lastLtServerSegmentSummary: "—",
+  lastLtClientTimelineSegEcho: "—",
+  lastProgressionSource: "—",
+  lastProgressionQuality: "—",
+};
 
 type LiveDebugSnapshot = {
+  /** Tracks latest getUserMedia outcome for this app session */
   micPermission: "pending" | "granted" | "denied";
+  /** `navigator.permissions` for microphone when supported (may differ until you press Start) */
+  browserMicPermission: string;
   audioContextState: string;
+  /** Total ScriptProcessor callbacks since mic session started */
+  audioProcessCallbacks: number;
+  /** How long ago `onaudioprocess` last ran (ms), refreshed while recording */
+  msSinceLastAudioProcess: number;
   chunksCreated: number;
-  chunksSent: number;
+  /** Successful HTTP responses from POST /stream (body read) */
+  chunksPosted: number;
+  /** Responses that passed epoch + recording gate and called applyResponse */
+  responsesApplied: number;
   lastChunkSize: number;
-  lastSamplePeak: number;
-  lastSampleRms: number;
+  /** Pre-boost mono peak (same downmix as WAV source, before gain). */
+  lastRawSamplePeak: number;
+  lastRawSampleRms: number;
+  /** After input boost + clamp [-1,1] — levels fed to WAV/PCM. */
+  lastBoostedSamplePeak: number;
+  lastBoostedSampleRms: number;
+  /** Linear gain applied in mic capture (WAV path only; speakers unchanged). */
+  liveInputBoost: number;
+  /** Fraction of samples in the last telemetry buffer that hit the clamp (pre-WAV). */
+  lastBoostClipFraction: number;
+  /** Channels in ScriptProcessor inputBuffer for last telemetry tick */
+  lastInputBufferChannels: number;
+  /** WAV chunk duration for current Live input mode (seconds). */
+  liveChunkSeconds: number;
+  /** Ms since a WAV chunk was queued for upload (while recording; refreshed ~250ms). */
+  msSinceLastChunkSent: number | null;
+  /** Ms since last /stream JSON received (while recording; refreshed ~250ms). */
+  msSinceLastStreamResponse: number | null;
+  /** Last API debug: weak_confirm_chunks */
+  lastPresetWeakConfirmChunks: number | null;
+  /** MediaStreamTrack snapshot (see Live debug) */
+  trackCount: number;
+  trackLabel: string;
+  trackEnabled: boolean;
+  trackMuted: boolean;
+  trackReadyState: string;
+  trackDeviceId: string;
+  trackSampleRate: string;
+  trackChannelCount: string;
+  trackEchoCancellation: string;
+  trackNoiseSuppression: string;
+  trackAutoGainControl: string;
   lastUploadStatus: string;
+  lastHttpStatus: number | null;
   lastBackendChord: string;
   lastBackendRaw: string;
-  lastBackendError: string;
+  /** Latest `debug.rejection_reason` from POST /stream (silence, weak_signal, …) */
+  lastStreamRejectionReason: string;
+  lastBackendWaveformRms: number | null;
+  lastBackendWaveformPeak: number | null;
+  lastBackendBestScore: number | null;
+  lastBackendSecondScore: number | null;
+  /** Backend template winner margin (best vs runner-up), not aggregate `confidence` field */
+  lastBackendTemplateMargin: number | null;
+  lastBackendFinalChord: string;
+  lastBackendAccepted: boolean | null;
+  lastBackendClearDisplay: boolean | null;
+  lastBackendChromaEntropy: number | null;
+  lastBackendChromaStability: number | null;
+  lastBackendStrongChromaBins: number | null;
+  lastBackendSilenceFlag: boolean | null;
+  /** Last response <code>debug.input_mode</code> (instrument / song / debug) */
+  lastStreamInputMode: string;
+  /** Last response <code>debug.preset_name</code> — human-readable preset label */
+  lastStreamPresetName: string;
+  /** Last API: consecutive chunks sub silence RMS before backend clears held chord */
+  lastPresetSilenceStreakClear: number | null;
+  /** Last API: consecutive gate rejects before backend forces clear_display */
+  lastPresetInvalidStreakClear: number | null;
+  /** Instant Krumhansl key on this chunk (`debug.instant_key_raw`) */
+  lastStreamInstantKeyRaw: string;
+  lastStreamInstantKeyConf: number | null;
+  /** Sticky internal key state (`debug.smoothed_key_raw_internal`) */
+  lastStreamSmoothedKeyRaw: string;
+  lastStreamKeyDisplaySource: string;
+  lastStreamHeldLastValid: boolean | null;
+  /** Last <code>debug.chord_commit_kind</code> (immediate vs confirmed vs gate, …) */
+  lastStreamChordCommitKind: string;
+  /** Last <code>debug.displayed_chord</code> (what the JSON <code>chord</code> field carried) */
+  lastStreamDisplayedChord: string;
+  lastFetchError: string;
+  lastUiError: string;
   ignoredResponseReason: string;
 };
 
 const LIVE_DEBUG_INITIAL: LiveDebugSnapshot = {
   micPermission: "pending",
+  browserMicPermission: "—",
   audioContextState: "—",
+  audioProcessCallbacks: 0,
+  msSinceLastAudioProcess: 0,
   chunksCreated: 0,
-  chunksSent: 0,
+  chunksPosted: 0,
+  responsesApplied: 0,
   lastChunkSize: 0,
-  lastSamplePeak: 0,
-  lastSampleRms: 0,
+  lastRawSamplePeak: 0,
+  lastRawSampleRms: 0,
+  lastBoostedSamplePeak: 0,
+  lastBoostedSampleRms: 0,
+  liveInputBoost: 1,
+  lastBoostClipFraction: 0,
+  lastInputBufferChannels: 0,
+  liveChunkSeconds: 1,
+  msSinceLastChunkSent: null,
+  msSinceLastStreamResponse: null,
+  lastPresetWeakConfirmChunks: null,
+  trackCount: 0,
+  trackLabel: "—",
+  trackEnabled: false,
+  trackMuted: false,
+  trackReadyState: "—",
+  trackDeviceId: "—",
+  trackSampleRate: "—",
+  trackChannelCount: "—",
+  trackEchoCancellation: "—",
+  trackNoiseSuppression: "—",
+  trackAutoGainControl: "—",
   lastUploadStatus: "—",
+  lastHttpStatus: null,
   lastBackendChord: "—",
   lastBackendRaw: "—",
-  lastBackendError: "—",
+  lastStreamRejectionReason: "—",
+  lastBackendWaveformRms: null,
+  lastBackendWaveformPeak: null,
+  lastBackendBestScore: null,
+  lastBackendSecondScore: null,
+  lastBackendTemplateMargin: null,
+  lastBackendFinalChord: "—",
+  lastBackendAccepted: null,
+  lastBackendClearDisplay: null,
+  lastBackendChromaEntropy: null,
+  lastBackendChromaStability: null,
+  lastBackendStrongChromaBins: null,
+  lastBackendSilenceFlag: null,
+  lastStreamInputMode: "—",
+  lastStreamPresetName: "—",
+  lastPresetSilenceStreakClear: null,
+  lastPresetInvalidStreakClear: null,
+  lastStreamInstantKeyRaw: "—",
+  lastStreamInstantKeyConf: null,
+  lastStreamSmoothedKeyRaw: "—",
+  lastStreamKeyDisplaySource: "—",
+  lastStreamHeldLastValid: null,
+  lastStreamChordCommitKind: "—",
+  lastStreamDisplayedChord: "—",
+  lastFetchError: "—",
+  lastUiError: "—",
   ignoredResponseReason: "—",
 };
 
@@ -58,13 +339,48 @@ const CHORD_PLACEHOLDER_LISTENING = "Listening...";
 const POST_STOP_FADE_MS = 5000;
 const POST_STOP_CLEAR_MS = 8000;
 
+type StreamDebug = {
+  raw_chord?: string;
+  final_chord?: string;
+  rejection_reason?: string;
+  accepted?: boolean;
+  clear_display?: boolean;
+  scores_top3?: [string, number][];
+  waveform_rms?: number;
+  waveform_peak?: number;
+  best_score?: number;
+  second_score?: number;
+  /** Template margin (same as backend `debug.confidence`); distinct from response `confidence` */
+  confidence?: number;
+  chroma_entropy?: number;
+  chroma_stability?: number;
+  strong_chroma_bins?: number;
+  silence?: boolean;
+  input_mode?: string;
+  preset_name?: string;
+  preset_weak_confirm_chunks?: number;
+  preset_silence_streak_clear?: number;
+  preset_invalid_streak_clear?: number;
+  preset_strong_best?: number;
+  preset_strong_margin?: number;
+  preset_medium_fast_best?: number;
+  preset_medium_fast_margin?: number;
+  held_last_valid_chord?: boolean;
+  key_display_source?: string;
+  instant_key_raw?: string | null;
+  instant_key_confidence?: number | null;
+  smoothed_key_raw_internal?: string;
+  chord_commit_kind?: string;
+  displayed_chord?: string;
+};
+
 type StreamResponse = {
   chord: string;
   confidence: number;
   key: string;
   key_confidence: number;
   timestamp: number;
-  debug?: { raw_chord?: string; scores_top3?: [string, number][] };
+  debug?: StreamDebug;
 };
 
 type AnalyzeRhythm = {
@@ -85,6 +401,10 @@ type AnalyzeChordSeg = {
   /** Debug: best template cosine at segment (optional from API) */
   template_score?: number | null;
   template_margin?: number | null;
+  /** Backend: sparse-chroma / vocal heuristics flagged this window */
+  vocal_interference?: boolean;
+  confidence_reasons?: string[];
+  exclude_from_core?: boolean;
 };
 
 type AnalyzeApiResponse = {
@@ -95,6 +415,7 @@ type AnalyzeApiResponse = {
   beats: { time: number }[];
   sections: { index: number; start: number; end: number; label: string; repeat_group?: string | null }[];
   rhythm?: AnalyzeRhythm;
+  debug?: Record<string, unknown>;
 };
 
 type ChordRun = {
@@ -107,6 +428,7 @@ type ChordRun = {
   anyLowConfidence: boolean;
   isPassing?: boolean;
   repeatCount: number;
+  excludeFromCore?: boolean;
 };
 
 function formatTimeSec(t: number): string {
@@ -120,6 +442,57 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** More decimals when levels are very small so quiet / leaky signal is visible. */
+function formatLivePeakRms(peak: number, rms: number): string {
+  const pDec = peak > 0 && peak < 0.001 ? 8 : peak < 0.01 ? 6 : 4;
+  const rDec = rms > 0 && rms < 0.0001 ? 10 : rms < 0.001 ? 8 : 5;
+  return `${peak.toFixed(pDec)} / ${rms.toFixed(rDec)}`;
+}
+
+function formatOptionalFloat(n: number | null | undefined, digits = 4): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return n.toFixed(digits);
+}
+
+function formatMsOptional(ms: number | null): string {
+  if (ms == null || !Number.isFinite(ms)) return "—";
+  return `${Math.round(ms)} ms`;
+}
+
+function applyTrackSnapshotToDebug(
+  snap: MicTrackDebugSnapshot,
+): Pick<
+  LiveDebugSnapshot,
+  | "trackCount"
+  | "trackLabel"
+  | "trackEnabled"
+  | "trackMuted"
+  | "trackReadyState"
+  | "trackDeviceId"
+  | "trackSampleRate"
+  | "trackChannelCount"
+  | "trackEchoCancellation"
+  | "trackNoiseSuppression"
+  | "trackAutoGainControl"
+> {
+  return {
+    trackCount: snap.trackCount,
+    trackLabel: snap.label || "—",
+    trackEnabled: snap.enabled,
+    trackMuted: snap.muted,
+    trackReadyState: snap.readyState || "—",
+    trackDeviceId: snap.settingsDeviceId ?? "—",
+    trackSampleRate: snap.settingsSampleRate != null ? String(snap.settingsSampleRate) : "—",
+    trackChannelCount: snap.settingsChannelCount != null ? String(snap.settingsChannelCount) : "—",
+    trackEchoCancellation:
+      snap.settingsEchoCancellation !== undefined ? String(snap.settingsEchoCancellation) : "—",
+    trackNoiseSuppression:
+      snap.settingsNoiseSuppression !== undefined ? String(snap.settingsNoiseSuppression) : "—",
+    trackAutoGainControl:
+      snap.settingsAutoGainControl !== undefined ? String(snap.settingsAutoGainControl) : "—",
+  };
 }
 
 function chordNotesLine(seg: AnalyzeChordSeg | null | undefined): string {
@@ -352,6 +725,7 @@ function groupChordRuns(chords: AnalyzeChordSeg[]): ChordRun[] {
         notesLine: chordNotesLine(c0),
         anyLowConfidence: slice.some((c) => c.low_confidence),
         isPassing: slice.some((c) => c.is_passing === true),
+        excludeFromCore: slice.some((c) => c.exclude_from_core === true),
         repeatCount: endSeg - startSeg + 1,
       });
       startSeg = i;
@@ -391,30 +765,37 @@ function formatApproxMeterPosition(
   return `~Bar ${barNum} · beat ${beatInBar} of ${bpb}`;
 }
 
-/** Backend margin scores are in [0, 1]. */
+/** Backend margin scores are in [0, 1] — tier labels for technical / snapshot use. */
 function confidenceLevel(value: number): "Low" | "Medium" | "High" {
   if (value >= 0.5) return "High";
   if (value >= 0.2) return "Medium";
   return "Low";
 }
 
+/** Friendlier readout for main UI (avoid harsh “low confidence” wording). */
+function readStrengthLabel(value: number): string {
+  if (value >= 0.5) return "Strong";
+  if (value >= 0.2) return "Moderate";
+  return "Light";
+}
+
 /** Illustrative stages while POST /analyze runs — not timed to real server progress. */
 const ANALYZE_STAGE_MESSAGES = [
   {
     title: "Loading audio",
-    detail: "Reading your file and sending it for analysis.",
+    detail: "Sending your track for analysis.",
   },
   {
     title: "Rhythm & tempo",
-    detail: "Detecting beats and tempo (may overlap with other steps on the server).",
+    detail: "Finding the pulse and tempo (steps may overlap on the server).",
   },
   {
     title: "Harmony",
-    detail: "Estimating key, chord changes, and practice sections.",
+    detail: "Mapping key, chords, and practice sections.",
   },
   {
-    title: "Finishing",
-    detail: "Preparing the timeline and progression for practice.",
+    title: "Almost ready",
+    detail: "Building the chart you will practice with.",
   },
 ] as const;
 
@@ -454,8 +835,90 @@ function speedPracticeTip(rate: AnalyzePlaybackSpeed): string {
   }
 }
 
+/** Map backend "N" to a non-technical placeholder (never show raw N in live transcription UI). */
+function transcribeChordDisplay(label: string | undefined | null): string {
+  const t = (label ?? "").trim();
+  if (!t || t === "N" || t === "n") {
+    return "—";
+  }
+  return t;
+}
+
+function transcribePickCurrentNotes(data: LiveTranscribeApiResponse): string[] {
+  const chords = data.chords ?? [];
+  const curRaw = data.current_chord?.trim();
+  const cur = curRaw && curRaw !== "N" ? curRaw : "";
+  const pickForLabel = (lab: string) => {
+    for (let i = chords.length - 1; i >= 0; i--) {
+      const c = chords[i];
+      if (c.label === lab && c.label !== "N") {
+        return c.notes ?? [];
+      }
+    }
+    return [];
+  };
+  if (cur) {
+    const n = pickForLabel(cur);
+    if (n.length) {
+      return n;
+    }
+  }
+  for (let i = chords.length - 1; i >= 0; i--) {
+    const c = chords[i];
+    if (c.label && c.label !== "N") {
+      return c.notes ?? [];
+    }
+  }
+  return [];
+}
+
+/** Client timeline rounding (query param). */
+function round4(x: number): number {
+  return Math.round(x * 10000) / 10000;
+}
+
+function formDataLiveTranscribeWav(blob: Blob): FormData {
+  const form = new FormData();
+  form.append("file", blob, "window.wav");
+  return form;
+}
+
+/** Shared −6…+6 display transpose; does not affect detection or stored analysis. */
+function TransposeDisplayControl(props: { id: string; value: number; onChange: (v: number) => void }) {
+  const options: { v: number; label: string }[] = [];
+  for (let s = -6; s <= 6; s++) {
+    options.push({
+      v: s,
+      label: s === 0 ? "Original" : s > 0 ? `+${s} semitones` : `${s} semitones`,
+    });
+  }
+  return (
+    <div className="transpose-display-row" role="group" aria-label="Transpose displayed chords">
+      <span className="transpose-display-heading">Transpose</span>
+      <label className="transpose-display-sr-only" htmlFor={props.id}>
+        Transpose displayed chords by semitones
+      </label>
+      <select
+        id={props.id}
+        className="transpose-display-select"
+        value={props.value}
+        onChange={(e) => props.onChange(Number.parseInt(e.target.value, 10))}
+      >
+        {options.map((o) => (
+          <option key={o.v} value={o.v}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+      <span className="transpose-display-note">Display only — audio unchanged</span>
+    </div>
+  );
+}
+
 export default function Home() {
   const [appMode, setAppMode] = useState<"live" | "file">("live");
+  /** Practice display: concert pitch vs written transposition; Analyze + Live transcription share this. */
+  const [displayTransposeSemitones, setDisplayTransposeSemitones] = useState(0);
 
   const [recording, setRecording] = useState(false);
   const [chord, setChord] = useState<string | null>(null);
@@ -467,21 +930,91 @@ export default function Home() {
   const [status, setStatus] = useState<string | null>(null);
   const [postStopFade, setPostStopFade] = useState(false);
 
-  const [liveTraceUI] = useState(() => {
+  const [liveConsoleDebug] = useState(() => {
     if (typeof window === "undefined") {
-      return LIVE_MIC_DEBUG;
+      return LIVE_MIC_CONSOLE;
     }
-    return LIVE_MIC_DEBUG || new URLSearchParams(window.location.search).get("liveDebug") === "1";
+    return LIVE_MIC_CONSOLE || new URLSearchParams(window.location.search).get("liveDebug") === "1";
   });
   const [liveDebug, setLiveDebug] = useState<LiveDebugSnapshot>(LIVE_DEBUG_INITIAL);
   const liveTelemetryThrottleRef = useRef(0);
+  const liveProcessTickRef = useRef({ index: 0, at: 0 });
+  const lastLiveChunkSentAtRef = useRef<number | null>(null);
+  const lastLiveStreamResponseAtRef = useRef<number | null>(null);
+  /** Live mode: optional mic picker (labels fill after permission). */
+  const [liveAudioInputs, setLiveAudioInputs] = useState<{ deviceId: string; label: string }[]>([]);
+  const [liveMicDeviceId, setLiveMicDeviceId] = useState("");
+  /** Live /stream sensitivity preset (query <code>mode</code>). */
+  const [liveInputMode, setLiveInputMode] = useState<LiveInputMode>("instrument");
+  /** Software gain on mic samples sent to /stream only (not speaker playback). */
+  const [liveInputBoost, setLiveInputBoost] = useState(1);
+  const liveBoostUserTouchedRef = useRef(false);
   /** Mic capture context: created synchronously on Start click, resumed before any await; reused across sessions. */
   const liveMicCtxRef = useRef<AudioContext | null>(null);
+
+  /** Instant /stream vs rolling-window live transcription. */
+  const [liveExperienceMode, setLiveExperienceMode] = useState<LiveExperienceMode>("instant");
+  const liveExperienceModeRef = useRef<LiveExperienceMode>("instant");
+  useEffect(() => {
+    liveExperienceModeRef.current = liveExperienceMode;
+  }, [liveExperienceMode]);
+
+  const [transcribeSessionId, setTranscribeSessionId] = useState("");
+  const transcribeSessionIdRef = useRef("");
+  useEffect(() => {
+    transcribeSessionIdRef.current = transcribeSessionId;
+  }, [transcribeSessionId]);
+
+  const [transcribeKey, setTranscribeKey] = useState<LiveTranscribeKey | null>(null);
+  const [transcribeTimeline, setTranscribeTimeline] = useState<TimelineSeg[]>([]);
+  const transcribeTimelineRef = useRef<TimelineSeg[]>([]);
+  useEffect(() => {
+    transcribeTimelineRef.current = transcribeTimeline;
+  }, [transcribeTimeline]);
+  const [transcribeServerDebug, setTranscribeServerDebug] = useState(false);
+  /** Best-effort progression from latest /live-transcribe JSON (stable + server fallback). */
+  const [liveServerCoreLabels, setLiveServerCoreLabels] = useState<string[]>([]);
+  const [liveProgressionMeta, setLiveProgressionMeta] = useState<LiveTranscribeApiResponse["progression_meta"] | null>(
+    null,
+  );
+  const [liveLastWindowChords, setLiveLastWindowChords] = useState<
+    { label: string; start: number; end: number; low_confidence?: boolean; confidence?: number }[]
+  >([]);
+  const [transcribeCurrentChord, setTranscribeCurrentChord] = useState("—");
+  const [transcribeCurrentNotes, setTranscribeCurrentNotes] = useState<string[]>([]);
+  const [transcribeSummary, setTranscribeSummary] = useState("");
+  const [transcribePhase, setTranscribePhase] = useState<"idle" | "listening" | "analyzing" | "ready">("idle");
+  const [transcribeDebug, setTranscribeDebug] = useState<TranscribeDebugSnapshot>(TRANSCRIBE_DEBUG_INITIAL);
+  const [transcribeCopyFlash, setTranscribeCopyFlash] = useState(false);
+  const [transcribeBufferDisplaySec, setTranscribeBufferDisplaySec] = useState(0);
+  const [transcribeRequestInFlight, setTranscribeRequestInFlight] = useState(false);
+  const transcribeRingRef = useRef<LiveTranscribeRing | null>(null);
+  const transcribeTimerRef = useRef<number | null>(null);
+  const transcribeSessionStartPerfRef = useRef(0);
+  const transcribeEpochRef = useRef(0);
+  const transcribeKickoffRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const transcribeRequestInFlightRef = useRef(false);
+  const transcribeCopyDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const liveDebugRef = useRef<LiveDebugSnapshot>(LIVE_DEBUG_INITIAL);
+  useEffect(() => {
+    liveDebugRef.current = liveDebug;
+  }, [liveDebug]);
+
+  useEffect(() => {
+    return () => {
+      if (transcribeCopyDoneTimerRef.current != null) {
+        clearTimeout(transcribeCopyDoneTimerRef.current);
+      }
+    };
+  }, []);
+
+  const liveChunkSeconds = useMemo(() => LIVE_CHUNK_SECONDS[liveInputMode], [liveInputMode]);
 
   const [analyzeFile, setAnalyzeFile] = useState<File | null>(null);
   const [analyzeFileName, setAnalyzeFileName] = useState<string | null>(null);
   const [analyzeResult, setAnalyzeResult] = useState<AnalyzeApiResponse | null>(null);
   const [analyzeLoading, setAnalyzeLoading] = useState(false);
+  const [analyzeQueryDebug, setAnalyzeQueryDebug] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
   const [analyzeAudioUrl, setAnalyzeAudioUrl] = useState<string | null>(null);
   const [analyzePlaybackTime, setAnalyzePlaybackTime] = useState(0);
@@ -496,6 +1029,120 @@ export default function Home() {
   const [loopRestarting, setLoopRestarting] = useState(false);
   /** Session-only: keyed by practice part identity; resets on new file/analysis */
   const [sessionPartChecklist, setSessionPartChecklist] = useState<Record<string, boolean[]>>({});
+
+  /** Browser `Permissions` API state for microphone (when supported). */
+  useEffect(() => {
+    if (appMode !== "live") return;
+    if (typeof navigator === "undefined" || !navigator.permissions?.query) {
+      setLiveDebug((p) => ({ ...p, browserMicPermission: "unsupported" }));
+      return;
+    }
+    let perm: PermissionStatus | null = null;
+    const sync = () => {
+      if (perm) {
+        setLiveDebug((p) => ({ ...p, browserMicPermission: perm!.state }));
+      }
+    };
+    navigator.permissions
+      .query({ name: "microphone" as PermissionName })
+      .then((p) => {
+        perm = p;
+        sync();
+        p.addEventListener("change", sync);
+      })
+      .catch(() => {
+        setLiveDebug((p) => ({ ...p, browserMicPermission: "query_failed" }));
+      });
+    return () => {
+      perm?.removeEventListener("change", sync);
+    };
+  }, [appMode]);
+
+  /** Mirror UI error string into Live debug. */
+  useEffect(() => {
+    if (appMode !== "live") return;
+    setLiveDebug((p) => ({ ...p, lastUiError: error ?? "—" }));
+  }, [error, appMode]);
+
+  /** Default boost per input type until the user picks a level manually. */
+  useEffect(() => {
+    if (liveBoostUserTouchedRef.current) return;
+    setLiveInputBoost(LIVE_BOOST_DEFAULTS[liveInputMode]);
+  }, [liveInputMode]);
+
+  /** Live song transcription listens like phone/speaker capture — pin to Song sensitivity when entering that mode. */
+  useEffect(() => {
+    if (liveExperienceMode !== "transcribe") return;
+    setLiveInputMode("song");
+  }, [liveExperienceMode]);
+
+  /** Keep debug snapshot in sync with WAV chunk length when input mode changes. */
+  useEffect(() => {
+    if (appMode !== "live") return;
+    setLiveDebug((p) => ({ ...p, liveChunkSeconds: LIVE_CHUNK_SECONDS[liveInputMode] }));
+  }, [liveInputMode, appMode]);
+
+  /** Refresh ScriptProcessor age / count while recording (onaudioprocess itself is not a React event). */
+  useEffect(() => {
+    if (!recording || appMode !== "live") return;
+    const id = window.setInterval(() => {
+      const { index, at } = liveProcessTickRef.current;
+      const msSince = at ? Math.max(0, Date.now() - at) : 0;
+      const now = Date.now();
+      const cAt = lastLiveChunkSentAtRef.current;
+      const rAt = lastLiveStreamResponseAtRef.current;
+      setLiveDebug((p) => ({
+        ...p,
+        audioProcessCallbacks: index,
+        msSinceLastAudioProcess: msSince,
+        msSinceLastChunkSent: cAt != null ? now - cAt : null,
+        msSinceLastStreamResponse: rAt != null ? now - rAt : null,
+      }));
+    }, 250);
+    return () => clearInterval(id);
+  }, [recording, appMode]);
+
+  /** Live transcription: sample rolling ring length for “gathering audio” UI (no technical copy in main status). */
+  useEffect(() => {
+    if (!recording || appMode !== "live" || liveExperienceMode !== "transcribe") {
+      return;
+    }
+    const tick = () => {
+      setTranscribeBufferDisplaySec(transcribeRingRef.current?.bufferedSeconds() ?? 0);
+    };
+    tick();
+    const id = window.setInterval(tick, 200);
+    return () => clearInterval(id);
+  }, [recording, appMode, liveExperienceMode]);
+
+  /** Refresh audio input device list (labels often empty until mic permission granted once). */
+  useEffect(() => {
+    if (appMode !== "live" || typeof navigator === "undefined" || !navigator.mediaDevices?.enumerateDevices) {
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const list = await navigator.mediaDevices.enumerateDevices();
+        if (cancelled) return;
+        const inputs = list
+          .filter((d) => d.kind === "audioinput")
+          .map((d) => ({
+            deviceId: d.deviceId,
+            label:
+              d.label?.trim() ||
+              (d.deviceId ? `Microphone (${d.deviceId.slice(0, 6)}…)` : "Audio input"),
+          }));
+        setLiveAudioInputs(inputs);
+      } catch {
+        /* ignore */
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [appMode, recording]);
 
   const analyzeAudioRef = useRef<HTMLAudioElement | null>(null);
   const progressionScrollRef = useRef<HTMLDivElement | null>(null);
@@ -561,6 +1208,16 @@ export default function Home() {
 
   const coreProgression = useMemo(() => deriveCoreProgression(chordRuns), [chordRuns]);
 
+  const coreProgressionDisplay = useMemo(() => {
+    const n = displayTransposeSemitones;
+    if (n === 0) return coreProgression;
+    return coreProgression.map((e) => ({
+      ...e,
+      label: transposeChordLabel(e.label, n),
+      notesLine: transposeChordToneLine(e.notesLine, n),
+    }));
+  }, [coreProgression, displayTransposeSemitones]);
+
   const currentChordLabelForHighlight = useMemo(() => {
     if (!analyzeResult) return "";
     return chordLabelAtTime(analyzePlaybackTime, analyzeResult.chords, analyzePlaybackDuration);
@@ -587,6 +1244,19 @@ export default function Home() {
     if (!nr) return { label: "End of chart", notesLine: "" };
     return { label: nr.label, notesLine: nr.notesLine };
   }, [analyzeResult, chordRuns, activeChordRunIndex]);
+
+  const nextRunDisplayForUi = useMemo(() => {
+    if (!analyzeResult || activeChordRunIndex < 0) return { label: "—", notesLine: "—" };
+    const nr = chordRuns[activeChordRunIndex + 1];
+    if (!nr) return { label: "End of chart", notesLine: "" };
+    const n = displayTransposeSemitones;
+    if (n === 0) return { label: nr.label, notesLine: nr.notesLine };
+    const segAt = analyzeResult.chords[nr.startSeg];
+    const notesLine = segAt
+      ? chordNotesLine(transposeChordSegment(segAt, n)!)
+      : transposeChordToneLine(nr.notesLine, n);
+    return { label: transposeChordLabel(nr.label, n), notesLine };
+  }, [analyzeResult, chordRuns, activeChordRunIndex, displayTransposeSemitones]);
 
   const selectedPracticePart = useMemo((): PracticePart | null => {
     if (loopSectionIndex === null || !practiceParts.length) {
@@ -668,13 +1338,20 @@ export default function Home() {
 
   const learnThisSongSummary = useMemo(() => {
     if (!analyzeResult) return null;
+    const coreForSummary = displayTransposeSemitones === 0 ? coreProgression : coreProgressionDisplay;
     return buildLearnThisSongSummary({
       keyLabel: analyzeResult.key.label,
       tempoBpm: analyzeResult.tempo,
-      coreEntries: coreProgression,
+      coreEntries: coreForSummary,
       practicePartCount: practiceParts.length,
     });
-  }, [analyzeResult, coreProgression, practiceParts.length]);
+  }, [analyzeResult, coreProgression, coreProgressionDisplay, displayTransposeSemitones, practiceParts.length]);
+
+  const analyzeChordsPracticeDisplay = useMemo((): AnalyzeChordSeg[] => {
+    if (!analyzeResult?.chords?.length) return [];
+    if (displayTransposeSemitones === 0) return analyzeResult.chords;
+    return analyzeResult.chords.map((c) => transposeChordSegment(c, displayTransposeSemitones)!);
+  }, [analyzeResult?.chords, displayTransposeSemitones]);
 
   const nextChordSegAfterCurrent = useMemo((): AnalyzeChordSeg | null => {
     if (!analyzeResult?.chords?.length || activeAnalyzeChordSeg < 0) return null;
@@ -703,6 +1380,16 @@ export default function Home() {
     return null;
   }, [analyzeResult, nextChordCountdown, nextChordSegAfterCurrent, chordRuns, activeChordRunIndex]);
 
+  const displayedNextChordSegForUi = useMemo(
+    () => transposeChordSegment(displayedNextChordSeg, displayTransposeSemitones),
+    [displayedNextChordSeg, displayTransposeSemitones],
+  );
+
+  const currentAnalyzeChordForUi = useMemo(
+    () => transposeChordSegment(currentAnalyzeChord, displayTransposeSemitones),
+    [currentAnalyzeChord, displayTransposeSemitones],
+  );
+
   const focusPracticePart = useMemo((): PracticePart | null => {
     if (!practiceParts.length) return null;
     const idx =
@@ -716,18 +1403,18 @@ export default function Home() {
 
   const focusPartChordSeq = useMemo(() => {
     if (!analyzeResult || !focusPracticePart) return [];
-    return chordSequenceForPart(focusPracticePart, analyzeResult.chords, analyzePlaybackDuration);
-  }, [analyzeResult, focusPracticePart, analyzePlaybackDuration]);
+    return chordSequenceForPart(focusPracticePart, analyzeChordsPracticeDisplay, analyzePlaybackDuration);
+  }, [analyzeResult, focusPracticePart, analyzeChordsPracticeDisplay, analyzePlaybackDuration]);
 
   const focusPracticePartSteps = useMemo(() => {
     if (!analyzeResult || !focusPracticePart) return [];
-    return buildPracticeStepsForPart(focusPracticePart, analyzeResult.chords, analyzePlaybackDuration);
-  }, [analyzeResult, focusPracticePart, analyzePlaybackDuration]);
+    return buildPracticeStepsForPart(focusPracticePart, analyzeChordsPracticeDisplay, analyzePlaybackDuration);
+  }, [analyzeResult, focusPracticePart, analyzeChordsPracticeDisplay, analyzePlaybackDuration]);
 
   const focusPianoPartSteps = useMemo(() => {
     if (!analyzeResult || !focusPracticePart) return [];
-    return buildPianoPracticeStepsForPart(focusPracticePart, analyzeResult.chords, analyzePlaybackDuration);
-  }, [analyzeResult, focusPracticePart, analyzePlaybackDuration]);
+    return buildPianoPracticeStepsForPart(focusPracticePart, analyzeChordsPracticeDisplay, analyzePlaybackDuration);
+  }, [analyzeResult, focusPracticePart, analyzeChordsPracticeDisplay, analyzePlaybackDuration]);
 
   const focusPartChecklistChecks = useMemo((): boolean[] | null => {
     if (!focusPracticePart) return null;
@@ -847,11 +1534,26 @@ export default function Home() {
   }, [analyzeFile]);
 
   const applyResponse = useCallback((data: StreamResponse) => {
+    const dbg = data.debug;
+    const accepted = dbg?.accepted === true;
+    const clearDisplay = dbg?.clear_display === true;
+
     setConfidence(data.confidence);
     setKey(data.key);
     setKeyConfidence(data.key_confidence);
-    if (data.chord !== "N") {
-      setChord(data.chord);
+
+    if (clearDisplay) {
+      setChord(null);
+      return;
+    }
+    if (data.chord === "N") {
+      setChord(null);
+      return;
+    }
+
+    setChord(data.chord);
+
+    if (accepted) {
       setChordHistory((prev) => {
         if (prev[0] === data.chord) {
           return prev;
@@ -864,7 +1566,7 @@ export default function Home() {
   const sendWav = useCallback(
     async (blob: Blob) => {
       const epoch = liveEpochRef.current;
-      if (LIVE_MIC_DEBUG) {
+      if (liveConsoleDebug) {
         console.info("[live] upload chunk", { bytes: blob.size, epoch });
       }
 
@@ -873,20 +1575,19 @@ export default function Home() {
 
       let res: Response;
       try {
-        res = await fetch(`${API_BASE}/stream`, {
+        res = await fetch(`${API_BASE}/stream?mode=${encodeURIComponent(liveInputMode)}`, {
           method: "POST",
           body: form,
         });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (liveTraceUI) {
-          setLiveDebug((p) => ({
-            ...p,
-            lastBackendError: msg,
-            lastUploadStatus: "fetch failed",
-          }));
-        }
-        if (LIVE_MIC_DEBUG) {
+        setLiveDebug((p) => ({
+          ...p,
+          lastFetchError: msg,
+          lastUploadStatus: "fetch failed (network / CORS / wrong API URL / offline)",
+          lastHttpStatus: null,
+        }));
+        if (liveConsoleDebug) {
           console.warn("[live] /stream fetch failed", e);
         }
         throw e;
@@ -894,29 +1595,99 @@ export default function Home() {
 
       if (!res.ok) {
         const text = await res.text();
-        if (liveTraceUI) {
-          setLiveDebug((p) => ({
-            ...p,
-            lastBackendError: `${res.status}: ${text.slice(0, 200)}`,
-            lastUploadStatus: `http ${res.status}`,
-          }));
-        }
+        setLiveDebug((p) => ({
+          ...p,
+          lastFetchError: `${res.status}: ${text.slice(0, 240)}`,
+          lastUploadStatus: `HTTP ${res.status} ${res.statusText}`,
+          lastHttpStatus: res.status,
+        }));
         throw new Error(`${res.status} ${res.statusText}: ${text}`);
       }
 
-      const data = (await res.json()) as StreamResponse;
+      let data: StreamResponse;
+      try {
+        data = (await res.json()) as StreamResponse;
+        lastLiveStreamResponseAtRef.current = Date.now();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setLiveDebug((p) => ({
+          ...p,
+          lastFetchError: `response not JSON: ${msg}`,
+          lastUploadStatus: `HTTP ${res.status} (invalid body)`,
+          lastHttpStatus: res.status,
+        }));
+        throw e;
+      }
 
-      if (epoch !== liveEpochRef.current) {
-        if (liveTraceUI) {
-          setLiveDebug((p) => ({
-            ...p,
-            lastBackendChord: data.chord,
-            lastBackendRaw: data.debug?.raw_chord ?? "—",
-            lastUploadStatus: `ok ${res.status} (ignored)`,
-            ignoredResponseReason: "stale_epoch",
-          }));
+      const stale = epoch !== liveEpochRef.current;
+      const stopped = !recordingRef.current;
+      let appliedInc = 0;
+      let ignored: string;
+      if (stale) {
+        ignored = "ignored: stale_epoch (Stop/Start changed session before this response)";
+      } else if (stopped) {
+        ignored = "ignored: recording_stopped (response arrived after Stop)";
+      } else {
+        appliedInc = 1;
+        if (data.debug?.clear_display) {
+          ignored = "applied: clear_display (backend cleared held chord)";
+        } else if (data.chord === "N") {
+          ignored = "applied: chord N — UI shows Listening…; history unchanged";
+        } else if (data.debug?.accepted === false) {
+          ignored = `applied: hold/update display without new history (${data.debug?.rejection_reason ?? "not accepted"})`;
+        } else {
+          ignored = "—";
         }
-        if (LIVE_MIC_DEBUG) {
+      }
+
+      const d = data.debug;
+      setLiveDebug((p) => ({
+        ...p,
+        chunksPosted: p.chunksPosted + 1,
+        responsesApplied: p.responsesApplied + appliedInc,
+        lastHttpStatus: res.status,
+        lastUploadStatus:
+          stale || stopped ? `HTTP ${res.status} OK (response not applied to UI)` : `HTTP ${res.status} OK`,
+        lastBackendChord: data.chord,
+        lastBackendRaw: d?.raw_chord ?? "—",
+        lastStreamRejectionReason: d?.rejection_reason ?? "—",
+        lastBackendWaveformRms: d?.waveform_rms ?? null,
+        lastBackendWaveformPeak: d?.waveform_peak ?? null,
+        lastBackendBestScore: d?.best_score ?? null,
+        lastBackendSecondScore: d?.second_score ?? null,
+        lastBackendTemplateMargin: d?.confidence ?? null,
+        lastBackendFinalChord: d?.final_chord ?? "—",
+        lastBackendAccepted: d?.accepted ?? null,
+        lastBackendClearDisplay: d?.clear_display ?? null,
+        lastBackendChromaEntropy: d?.chroma_entropy ?? null,
+        lastBackendChromaStability: d?.chroma_stability ?? null,
+        lastBackendStrongChromaBins: d?.strong_chroma_bins ?? null,
+        lastBackendSilenceFlag: d?.silence ?? null,
+        lastStreamInputMode: d?.input_mode ?? "—",
+        lastStreamPresetName: d?.preset_name ?? "—",
+        lastPresetWeakConfirmChunks: d?.preset_weak_confirm_chunks ?? null,
+        lastPresetSilenceStreakClear: d?.preset_silence_streak_clear ?? null,
+        lastPresetInvalidStreakClear: d?.preset_invalid_streak_clear ?? null,
+        lastStreamInstantKeyRaw:
+          d?.instant_key_raw != null && d.instant_key_raw !== "" ? String(d.instant_key_raw) : "—",
+        lastStreamInstantKeyConf:
+          typeof d?.instant_key_confidence === "number" ? d.instant_key_confidence : null,
+        lastStreamSmoothedKeyRaw:
+          d?.smoothed_key_raw_internal != null && String(d.smoothed_key_raw_internal) !== ""
+            ? String(d.smoothed_key_raw_internal)
+            : "—",
+        lastStreamKeyDisplaySource: d?.key_display_source != null ? String(d.key_display_source) : "—",
+        lastStreamHeldLastValid: typeof d?.held_last_valid_chord === "boolean" ? d.held_last_valid_chord : null,
+        lastStreamChordCommitKind:
+          d?.chord_commit_kind != null && String(d.chord_commit_kind) !== "" ? String(d.chord_commit_kind) : "—",
+        lastStreamDisplayedChord:
+          d?.displayed_chord != null && String(d.displayed_chord) !== "" ? String(d.displayed_chord) : "—",
+        lastFetchError: "—",
+        ignoredResponseReason: ignored,
+      }));
+
+      if (stale) {
+        if (liveConsoleDebug) {
           console.info("[live] ignore response (stale epoch)", {
             epoch,
             current: liveEpochRef.current,
@@ -925,34 +1696,14 @@ export default function Home() {
         }
         return;
       }
-      if (!recordingRef.current) {
-        if (liveTraceUI) {
-          setLiveDebug((p) => ({
-            ...p,
-            lastBackendChord: data.chord,
-            lastBackendRaw: data.debug?.raw_chord ?? "—",
-            lastUploadStatus: `ok ${res.status} (ignored)`,
-            ignoredResponseReason: "recording_stopped",
-          }));
-        }
-        if (LIVE_MIC_DEBUG) {
+      if (stopped) {
+        if (liveConsoleDebug) {
           console.info("[live] ignore response (recording stopped)", { chord: data.chord });
         }
         return;
       }
 
-      if (liveTraceUI) {
-        setLiveDebug((p) => ({
-          ...p,
-          chunksSent: p.chunksSent + 1,
-          lastUploadStatus: `ok ${res.status}`,
-          lastBackendChord: data.chord,
-          lastBackendRaw: data.debug?.raw_chord ?? "—",
-          lastBackendError: "—",
-          ignoredResponseReason: "—",
-        }));
-      }
-      if (LIVE_MIC_DEBUG) {
+      if (liveConsoleDebug) {
         console.info("[live] /stream ok", {
           chord: data.chord,
           confidence: data.confidence,
@@ -961,8 +1712,243 @@ export default function Home() {
       }
       applyResponse(data);
     },
-    [applyResponse, liveTraceUI],
+    [applyResponse, liveConsoleDebug, liveInputMode],
   );
+
+  const clearTranscribeSession = useCallback(() => {
+    transcribeEpochRef.current += 1;
+    transcribeRequestInFlightRef.current = false;
+    setTranscribeRequestInFlight(false);
+    if (transcribeCopyDoneTimerRef.current != null) {
+      clearTimeout(transcribeCopyDoneTimerRef.current);
+      transcribeCopyDoneTimerRef.current = null;
+    }
+    setTranscribeCopyFlash(false);
+    if (transcribeKickoffRef.current != null) {
+      clearTimeout(transcribeKickoffRef.current);
+      transcribeKickoffRef.current = null;
+    }
+    transcribeRingRef.current?.clear();
+    setTranscribeBufferDisplaySec(0);
+    setTranscribeKey(null);
+    setTranscribeTimeline([]);
+    setTranscribeCurrentChord("—");
+    setTranscribeCurrentNotes([]);
+    setTranscribeSummary("");
+    setTranscribeDebug(TRANSCRIBE_DEBUG_INITIAL);
+    setLiveServerCoreLabels([]);
+    setLiveProgressionMeta(null);
+    setLiveLastWindowChords([]);
+    const sid = `lt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+    setTranscribeSessionId(sid);
+    transcribeSessionIdRef.current = sid;
+    transcribeSessionStartPerfRef.current = performance.now();
+    setTranscribePhase(recordingRef.current ? "listening" : "idle");
+  }, []);
+
+  const runTranscribeCycle = useCallback(async () => {
+    if (liveExperienceModeRef.current !== "transcribe" || !recordingRef.current) {
+      return;
+    }
+    if (transcribeRequestInFlightRef.current) {
+      return;
+    }
+    const epoch = transcribeEpochRef.current;
+    const ring = transcribeRingRef.current;
+    if (!ring) {
+      return;
+    }
+
+    const bufSec = ring.bufferedSeconds();
+    const dbgSnap = liveDebugRef.current;
+
+    setTranscribeDebug((p) => ({
+      ...p,
+      ringBufferedSec: bufSec,
+      lastRawPeak: dbgSnap.lastRawSamplePeak,
+      lastRawRms: dbgSnap.lastRawSampleRms,
+    }));
+
+    if (bufSec < FIRST_TRANSCRIBE_AFTER_SEC) {
+      setTranscribePhase("listening");
+      return;
+    }
+
+    const sr = ring.getSampleRate();
+    const mono = ring.sliceLastSeconds(TRANSCRIBE_WINDOW_SEC);
+    const durActual = sr > 0 ? mono.length / sr : 0;
+    if (mono.length === 0 || durActual < MIN_TRANSCRIBE_AUDIO_SEC) {
+      setTranscribePhase("listening");
+      return;
+    }
+
+    transcribeRequestInFlightRef.current = true;
+    setTranscribeRequestInFlight(true);
+    setTranscribePhase("analyzing");
+
+    const tReq0 = performance.now();
+    const nowSec = (performance.now() - transcribeSessionStartPerfRef.current) / 1000;
+    const windowEnd = nowSec;
+    const windowStart = Math.max(0, windowEnd - durActual);
+
+    const blob = encodeFloat32MonoToWav(mono, sr);
+    const sessionId = transcribeSessionIdRef.current;
+
+    try {
+      let res: Response;
+      try {
+        const qs = new URLSearchParams({
+          window_start: String(round4(windowStart)),
+          mode: "song",
+        });
+        if (sessionId) {
+          qs.set("session_id", sessionId);
+        }
+        if (transcribeServerDebug) {
+          qs.set("debug", "true");
+          qs.set("client_timeline_seg_count", String(transcribeTimelineRef.current.length));
+        }
+        res = await fetch(`${API_BASE}/live-transcribe?${qs.toString()}`, {
+          method: "POST",
+          body: formDataLiveTranscribeWav(blob),
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (transcribeEpochRef.current !== epoch || !recordingRef.current) {
+          return;
+        }
+        setTranscribeDebug((p) => ({
+          ...p,
+          lastRequestStatus: "network error",
+          lastError: msg,
+          lastWindowSec: durActual,
+          lastRequestDurationMs: Math.round(performance.now() - tReq0),
+          lastAnalysisStatus: "—",
+        }));
+        setTranscribePhase("listening");
+        return;
+      }
+
+      if (transcribeEpochRef.current !== epoch || !recordingRef.current) {
+        return;
+      }
+
+      const bodyText = await res.text();
+      const requestMs = Math.round(performance.now() - tReq0);
+
+      if (!res.ok) {
+        setTranscribeDebug((p) => ({
+          ...p,
+          lastRequestStatus: `HTTP ${res.status}`,
+          lastError: bodyText.slice(0, 480),
+          lastWindowSec: durActual,
+          lastRequestDurationMs: requestMs,
+          lastAnalysisStatus: "—",
+        }));
+        setTranscribePhase("listening");
+        return;
+      }
+
+      let data: LiveTranscribeApiResponse;
+      try {
+        data = JSON.parse(bodyText) as LiveTranscribeApiResponse;
+      } catch {
+        setTranscribeDebug((p) => ({
+          ...p,
+          lastRequestStatus: `HTTP ${res.status} (bad JSON)`,
+          lastError: bodyText.slice(0, 200),
+          lastWindowSec: durActual,
+          lastRequestDurationMs: requestMs,
+          lastAnalysisStatus: "—",
+        }));
+        setTranscribePhase("listening");
+        return;
+      }
+
+      if (transcribeEpochRef.current !== epoch || !recordingRef.current) {
+        return;
+      }
+
+      if (liveConsoleDebug) {
+        console.info("[live-transcribe] ok", {
+          window: [data.window_start, data.window_end],
+          key: data.key,
+          core: data.core_progression?.map((c) => c.label),
+          status: data.status,
+          requestMs,
+        });
+      }
+
+      const dbg = data.debug;
+      setTranscribeDebug((p) => ({
+        ...p,
+        lastRequestStatus: `HTTP ${res.status} OK`,
+        lastError: "—",
+        analysisCount: p.analysisCount + 1,
+        lastWindowSec: durActual,
+        lastKeyLabel: data.key.label,
+        lastProgression: (data.core_progression ?? []).map((c) => c.label).join(" → ") || "—",
+        lastRequestDurationMs: requestMs,
+        lastAnalysisStatus: data.status ?? "—",
+        lastLtCoreEmptyReason:
+          dbg && typeof dbg.progression_empty_reason === "string"
+            ? dbg.progression_empty_reason
+            : typeof data.progression_meta?.empty_reason === "string"
+              ? data.progression_meta.empty_reason
+              : "—",
+        lastLtRunsForCoreStrategy:
+          dbg && typeof dbg.runs_for_core_strategy === "string" ? dbg.runs_for_core_strategy : "—",
+        lastLtServerSegmentSummary:
+          dbg &&
+          typeof dbg.segment_count === "number" &&
+          typeof dbg.stable_segment_count === "number" &&
+          typeof dbg.low_confidence_segment_count === "number"
+            ? `${dbg.segment_count} total / ${dbg.stable_segment_count} stable / ${dbg.low_confidence_segment_count} low-conf`
+            : "—",
+        lastLtClientTimelineSegEcho:
+          dbg && typeof dbg.client_timeline_merged_seg_count === "number"
+            ? String(dbg.client_timeline_merged_seg_count)
+            : "—",
+        lastProgressionSource: data.progression_meta?.source ?? "—",
+        lastProgressionQuality: data.progression_meta?.quality ?? "—",
+      }));
+
+      setLiveServerCoreLabels((data.core_progression ?? []).map((c) => c.label));
+      setLiveProgressionMeta(data.progression_meta ?? null);
+      setLiveLastWindowChords(
+        (data.chords ?? []).map((c) => ({
+          label: c.label,
+          start: c.start,
+          end: c.end,
+          low_confidence: c.low_confidence,
+          confidence: c.confidence,
+        })),
+      );
+
+      setTranscribeKey((prev) =>
+        mergeLiveTranscribeKey(prev, {
+          label: data.key.label,
+          confidence: data.key.confidence,
+        }),
+      );
+      setTranscribeTimeline((prev) =>
+        mergeTranscribeTimeline(
+          prev,
+          data.window_start,
+          data.window_end,
+          (data.chords ?? []).filter((c) => c.label !== "N"),
+          TRANSCRIBE_TIMELINE_KEEP_SEC,
+        ),
+      );
+      setTranscribeCurrentChord(transcribeChordDisplay(data.current_chord));
+      setTranscribeCurrentNotes(transcribePickCurrentNotes(data));
+      setTranscribeSummary(data.summary ?? "");
+      setTranscribePhase(data.status === "ready" ? "ready" : "listening");
+    } finally {
+      transcribeRequestInFlightRef.current = false;
+      setTranscribeRequestInFlight(false);
+    }
+  }, [liveConsoleDebug, transcribeServerDebug]);
 
   const startRecording = useCallback(async () => {
     liveEpochRef.current += 1;
@@ -971,13 +1957,51 @@ export default function Home() {
     clearPostStopTimers();
     setChord(null);
     setChordHistory([]);
-    setLiveDebug({
+    liveProcessTickRef.current = { index: 0, at: 0 };
+    lastLiveChunkSentAtRef.current = null;
+    lastLiveStreamResponseAtRef.current = null;
+    const isTranscribe = liveExperienceMode === "transcribe";
+
+    if (isTranscribe) {
+      if (transcribeKickoffRef.current != null) {
+        clearTimeout(transcribeKickoffRef.current);
+        transcribeKickoffRef.current = null;
+      }
+      transcribeEpochRef.current += 1;
+      if (transcribeTimerRef.current != null) {
+        clearInterval(transcribeTimerRef.current);
+        transcribeTimerRef.current = null;
+      }
+      transcribeRequestInFlightRef.current = false;
+      setTranscribeRequestInFlight(false);
+      setTranscribeBufferDisplaySec(0);
+      transcribeRingRef.current = new LiveTranscribeRing(TRANSCRIBE_RING_MAX_SEC);
+      transcribeSessionStartPerfRef.current = performance.now();
+      const sid = `lt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+      setTranscribeSessionId(sid);
+      transcribeSessionIdRef.current = sid;
+      setTranscribeKey(null);
+      setTranscribeTimeline([]);
+      setTranscribeCurrentChord("—");
+      setTranscribeCurrentNotes([]);
+      setTranscribeSummary("");
+      setTranscribePhase("listening");
+      setTranscribeDebug(TRANSCRIBE_DEBUG_INITIAL);
+      setLiveServerCoreLabels([]);
+      setLiveProgressionMeta(null);
+      setLiveLastWindowChords([]);
+    }
+
+    setLiveDebug((prev) => ({
       ...LIVE_DEBUG_INITIAL,
+      liveInputBoost,
+      liveChunkSeconds,
+      browserMicPermission: prev.browserMicPermission,
       micPermission: "pending",
-    });
+    }));
 
     if (sessionRef.current) {
-      if (LIVE_MIC_DEBUG) {
+      if (liveConsoleDebug) {
         console.info("[live] stopping previous mic session before restart");
       }
       try {
@@ -998,84 +2022,138 @@ export default function Home() {
         liveMicCtxRef.current = sharedCtx;
       }
       void sharedCtx.resume();
-      if (liveTraceUI) {
-        setLiveDebug((p) => ({ ...p, audioContextState: sharedCtx.state }));
-      }
+      setLiveDebug((p) => ({ ...p, audioContextState: sharedCtx.state }));
 
       recordingRef.current = true;
       const session = await startMicWavChunks({
         audioContext: sharedCtx,
-        chunkSeconds: CHUNK_SECONDS,
+        deviceId: liveMicDeviceId || undefined,
+        chunkSeconds: isTranscribe ? 1 : liveChunkSeconds,
         tailMinSeconds: 0.2,
-        onDebug:
-          LIVE_MIC_DEBUG || liveTraceUI
-            ? (message, detail) => {
-                if (LIVE_MIC_DEBUG) {
-                  console.info("[live:mic]", message, detail ?? "");
-                }
-                if (message === "get_user_media_ok") {
-                  setLiveDebug((p) => ({ ...p, micPermission: "granted" }));
-                }
-              }
-            : undefined,
-        onTelemetry:
-          LIVE_MIC_DEBUG || liveTraceUI
-            ? (info) => {
-                const now = Date.now();
-                if (now - liveTelemetryThrottleRef.current < 220) {
-                  return;
-                }
-                liveTelemetryThrottleRef.current = now;
-                setLiveDebug((p) => ({
-                  ...p,
-                  audioContextState: info.audioContextState,
-                  lastSamplePeak: info.inputPeak,
-                  lastSampleRms: info.inputRms,
-                }));
-              }
-            : undefined,
-        onChunk: ({ blob }) => {
-          if (liveTraceUI) {
-            setLiveDebug((p) => ({
-              ...p,
-              chunksCreated: p.chunksCreated + 1,
-              lastChunkSize: blob.size,
-            }));
+        inputBoost: liveInputBoost,
+        streamChunks: !isTranscribe,
+        onDebug: (message, detail) => {
+          if (liveConsoleDebug) {
+            console.info("[live:mic]", message, detail ?? "");
           }
-          sendWav(blob).catch((e) => {
-            const message = e instanceof Error ? e.message : String(e);
-            setError(message);
-            if (LIVE_MIC_DEBUG) {
-              console.warn("[live] sendWav error", message);
-            }
-          });
+          if (message === "get_user_media_ok") {
+            setLiveDebug((p) => ({ ...p, micPermission: "granted" }));
+          }
         },
+        onTrackSnapshot: (snap) => {
+          setLiveDebug((p) => ({ ...p, ...applyTrackSnapshotToDebug(snap) }));
+        },
+        onTelemetry: (info) => {
+          const now = Date.now();
+          if (now - liveTelemetryThrottleRef.current < 220) {
+            return;
+          }
+          liveTelemetryThrottleRef.current = now;
+          setLiveDebug((p) => ({
+            ...p,
+            audioContextState: info.audioContextState,
+            lastRawSamplePeak: info.inputPeak,
+            lastRawSampleRms: info.inputRms,
+            lastBoostedSamplePeak: info.boostedPeak,
+            lastBoostedSampleRms: info.boostedRms,
+            liveInputBoost: info.inputBoost,
+            lastBoostClipFraction: info.clippedFractionInBuffer,
+            lastInputBufferChannels: info.inputChannels,
+          }));
+        },
+        onProcessTick: ({ callbackIndex }) => {
+          liveProcessTickRef.current = { index: callbackIndex, at: Date.now() };
+        },
+        onMonoFrames:
+          isTranscribe
+            ? (mono, sr) => {
+                transcribeRingRef.current?.push(mono, sr);
+              }
+            : undefined,
+        onChunk: isTranscribe
+          ? undefined
+          : ({ blob }) => {
+              lastLiveChunkSentAtRef.current = Date.now();
+              setLiveDebug((p) => ({
+                ...p,
+                chunksCreated: p.chunksCreated + 1,
+                lastChunkSize: blob.size,
+              }));
+              sendWav(blob).catch((e) => {
+                const message = e instanceof Error ? e.message : String(e);
+                setError(message);
+                if (liveConsoleDebug) {
+                  console.warn("[live] sendWav error", message);
+                }
+              });
+            },
         onError: (err) => {
           setError(err.message);
-          if (LIVE_MIC_DEBUG) {
+          if (liveConsoleDebug) {
             console.warn("[live:mic] onError", err);
           }
         },
       });
       sessionRef.current = session;
       setRecording(true);
-      if (liveTraceUI) {
-        setLiveDebug((p) => ({ ...p, audioContextState: sharedCtx.state }));
+      setLiveDebug((p) => ({ ...p, audioContextState: sharedCtx.state }));
+      if (isTranscribe) {
+        if (transcribeKickoffRef.current != null) {
+          clearTimeout(transcribeKickoffRef.current);
+        }
+        transcribeKickoffRef.current = setTimeout(() => {
+          transcribeKickoffRef.current = null;
+          void runTranscribeCycle();
+        }, FIRST_TRANSCRIBE_DELAY_MS);
+        transcribeTimerRef.current = window.setInterval(() => {
+          void runTranscribeCycle();
+        }, TRANSCRIBE_INTERVAL_MS);
       }
     } catch (e) {
       recordingRef.current = false;
+      if (transcribeTimerRef.current != null) {
+        clearInterval(transcribeTimerRef.current);
+        transcribeTimerRef.current = null;
+      }
+      if (transcribeKickoffRef.current != null) {
+        clearTimeout(transcribeKickoffRef.current);
+        transcribeKickoffRef.current = null;
+      }
+      transcribeRequestInFlightRef.current = false;
+      setTranscribeRequestInFlight(false);
       const message = e instanceof Error ? e.message : String(e);
       setError(message);
       setLiveDebug((p) => ({ ...p, micPermission: "denied" }));
-      if (LIVE_MIC_DEBUG) {
+      if (liveConsoleDebug) {
         console.warn("[live] startRecording failed", message);
       }
     }
-  }, [sendWav, clearPostStopTimers, liveTraceUI]);
+  }, [
+    sendWav,
+    clearPostStopTimers,
+    liveConsoleDebug,
+    liveMicDeviceId,
+    liveInputBoost,
+    liveChunkSeconds,
+    liveExperienceMode,
+    runTranscribeCycle,
+  ]);
 
   const stopRecording = useCallback(async () => {
     recordingRef.current = false;
     liveEpochRef.current += 1;
+    transcribeEpochRef.current += 1;
+    if (transcribeTimerRef.current != null) {
+      clearInterval(transcribeTimerRef.current);
+      transcribeTimerRef.current = null;
+    }
+    if (transcribeKickoffRef.current != null) {
+      clearTimeout(transcribeKickoffRef.current);
+      transcribeKickoffRef.current = null;
+    }
+    transcribeRequestInFlightRef.current = false;
+    setTranscribeRequestInFlight(false);
+    setTranscribeBufferDisplaySec(0);
     const session = sessionRef.current;
     sessionRef.current = null;
     if (session) {
@@ -1083,11 +2161,10 @@ export default function Home() {
     }
     setRecording(false);
     setStatus("Stopped.");
-    if (liveTraceUI) {
-      const ctx = liveMicCtxRef.current;
-      setLiveDebug((p) => ({ ...p, audioContextState: ctx && ctx.state !== "closed" ? ctx.state : "—" }));
-    }
-  }, [liveTraceUI]);
+    setTranscribePhase((p) => (p === "idle" ? "idle" : "ready"));
+    const ctx = liveMicCtxRef.current;
+    setLiveDebug((p) => ({ ...p, audioContextState: ctx && ctx.state !== "closed" ? ctx.state : "—" }));
+  }, []);
 
   const onAnalyzeFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] ?? null;
@@ -1108,7 +2185,7 @@ export default function Home() {
     try {
       const fd = new FormData();
       fd.append("file", analyzeFile);
-      const res = await fetch(`${API_BASE}/analyze`, {
+      const res = await fetch(`${API_BASE}/analyze?debug=${analyzeQueryDebug ? "true" : "false"}`, {
         method: "POST",
         body: fd,
       });
@@ -1129,7 +2206,7 @@ export default function Home() {
     } finally {
       setAnalyzeLoading(false);
     }
-  }, [analyzeFile]);
+  }, [analyzeFile, analyzeQueryDebug]);
 
   const syncAnalyzePlaybackFromElement = useCallback(
     (el: HTMLAudioElement) => {
@@ -1265,12 +2342,295 @@ export default function Home() {
       ? "chord-stage-value chord-stage-fading"
       : "chord-stage-value";
 
+  const liveInstantChordTonesLine = useMemo(() => {
+    if (liveExperienceMode !== "instant") return null;
+    if (chord == null) return null;
+    const notes = liveTriadNoteNamesFromLabel(chord);
+    if (!notes?.length) return null;
+    return notes.join(" · ");
+  }, [liveExperienceMode, chord]);
+
+  const liveAudioProcessingSummary = useMemo(() => {
+    if (!recording) {
+      return "Idle (not recording)";
+    }
+    if (liveDebug.audioProcessCallbacks < 1) {
+      return "No callbacks yet — if this stays at 0, audio is not reaching ScriptProcessor (suspended AudioContext, bad graph, or browser restriction)";
+    }
+    if (liveDebug.msSinceLastAudioProcess > 3000) {
+      return `Stale: last onaudioprocess ${liveDebug.msSinceLastAudioProcess}ms ago (background tab / throttling?)`;
+    }
+    return `Firing — callback #${liveDebug.audioProcessCallbacks}, last tick ${liveDebug.msSinceLastAudioProcess}ms ago`;
+  }, [recording, liveDebug.audioProcessCallbacks, liveDebug.msSinceLastAudioProcess]);
+
+  const transcribeRecentTimeline = useMemo(() => {
+    if (!transcribeTimeline.length) {
+      return [];
+    }
+    const lastT = transcribeTimeline[transcribeTimeline.length - 1].t1;
+    const cutoff = lastT - TRANSCRIBE_TIMELINE_KEEP_SEC;
+    return transcribeTimeline.filter((s) => s.t1 > cutoff);
+  }, [transcribeTimeline]);
+
+  const liveDerivedProgression = useMemo(
+    () =>
+      deriveLiveStableProgression(transcribeTimeline, {
+        analysisCount: transcribeDebug.analysisCount,
+        bufferSec: transcribeBufferDisplaySec,
+      }),
+    [transcribeTimeline, transcribeDebug.analysisCount, transcribeBufferDisplaySec],
+  );
+
+  const liveDisplayProgressionChips = useMemo(() => {
+    const fromTimeline = liveDerivedProgression.chipLabels;
+    if (fromTimeline.length) {
+      return fromTimeline;
+    }
+    if (liveServerCoreLabels.length) {
+      return liveServerCoreLabels.slice(0, 8);
+    }
+    return deriveFallbackProgressionFromWindowChords(liveLastWindowChords, 8);
+  }, [liveDerivedProgression.chipLabels, liveServerCoreLabels, liveLastWindowChords]);
+
+  const liveDisplayProgressionUi = useMemo(() => {
+    const chips = liveDisplayProgressionChips;
+    if (!chips.length) {
+      const r = liveProgressionMeta?.empty_reason;
+      let primary = "Still listening for the progression…";
+      if (r === "all_low_confidence") {
+        primary = "Still listening";
+      }
+      return {
+        chips,
+        qualityPrimary: primary,
+        qualitySecondary:
+          r === "all_low_confidence"
+            ? "Harmony reads uncertain — try a clearer moment or louder chords."
+            : r && r !== "waiting_for_more_audio"
+              ? `Reason: ${r.replace(/_/g, " ")}`
+              : undefined,
+      };
+    }
+    if (liveDerivedProgression.chipLabels.length) {
+      return {
+        chips,
+        qualityPrimary: liveDerivedProgression.qualityLabel,
+        qualitySecondary: liveDerivedProgression.usedLenientFallback
+          ? "Coarse read from merged timeline"
+          : undefined,
+      };
+    }
+    if (liveServerCoreLabels.length) {
+      const q = liveProgressionMeta?.quality;
+      if (q === "likely") {
+        return {
+          chips,
+          qualityPrimary: "Likely progression",
+          qualitySecondary: "From recent full-window analysis",
+        };
+      }
+      if (q === "stabilizing") {
+        return {
+          chips,
+          qualityPrimary: "Pattern stabilizing",
+          qualitySecondary: "From recent full-window analysis",
+        };
+      }
+      return {
+        chips,
+        qualityPrimary: "Rough progression so far",
+        qualitySecondary: "From recent full-window analysis",
+      };
+    }
+    return {
+      chips,
+      qualityPrimary: "Rough progression so far",
+      qualitySecondary: "From the latest short window only",
+    };
+  }, [
+    liveDisplayProgressionChips,
+    liveDerivedProgression.chipLabels.length,
+    liveDerivedProgression.qualityLabel,
+    liveDerivedProgression.usedLenientFallback,
+    liveServerCoreLabels.length,
+    liveProgressionMeta?.empty_reason,
+    liveProgressionMeta?.quality,
+  ]);
+
+  const liveChordLabelForDisplay = useCallback(
+    (raw: string | null | undefined) => {
+      const d = transcribeChordDisplay(raw);
+      if (d === "—" || displayTransposeSemitones === 0) return d;
+      return transposeChordLabel(d, displayTransposeSemitones);
+    },
+    [displayTransposeSemitones],
+  );
+
+  const transcribeCurrentChordForUi = useMemo(() => {
+    if (transcribeCurrentChord === "—" || displayTransposeSemitones === 0) return transcribeCurrentChord;
+    return transposeChordLabel(transcribeCurrentChord, displayTransposeSemitones);
+  }, [transcribeCurrentChord, displayTransposeSemitones]);
+
+  const transcribeCurrentNotesForUi = useMemo(
+    () =>
+      displayTransposeSemitones === 0 || !transcribeCurrentNotes.length
+        ? transcribeCurrentNotes
+        : transposeNotes(transcribeCurrentNotes, displayTransposeSemitones),
+    [transcribeCurrentNotes, displayTransposeSemitones],
+  );
+
+  const transcribeLiveStatus = useMemo((): { headline: string; sub?: string } => {
+    if (liveExperienceMode !== "transcribe") {
+      return { headline: "" };
+    }
+    const hasCore = liveDisplayProgressionChips.length > 0;
+    const analysisCount = transcribeDebug.analysisCount;
+
+    if (!recording) {
+      if (transcribePhase === "idle") {
+        return {
+          headline: "Ready when you are.",
+          sub: "Press Start listening and give us a few seconds of clear harmony from the room.",
+        };
+      }
+      return { headline: "Stopped.", sub: "Your last readout is below." };
+    }
+
+    if (transcribeRequestInFlight) {
+      return {
+        headline: "Updating…",
+        sub: "Refreshing the last few seconds of audio.",
+      };
+    }
+
+    if (transcribeBufferDisplaySec < FIRST_TRANSCRIBE_AFTER_SEC) {
+      return {
+        headline: "Buffering…",
+        sub: "First chords usually appear after a few seconds of steady listening.",
+      };
+    }
+
+    if (analysisCount === 0) {
+      return {
+        headline: "Listening…",
+        sub: "Hang tight — first chords are on the way.",
+      };
+    }
+
+    if (hasCore) {
+      return {
+        headline: "Main progression shaping up",
+        sub: "We will keep refreshing while the music plays. Live transcription is rough — upload the file for best accuracy.",
+      };
+    }
+
+    return {
+      headline: "Finding the pattern…",
+      sub: "Keep playing; we need a bit more harmony to suggest a loop.",
+    };
+  }, [
+    liveExperienceMode,
+    recording,
+    transcribePhase,
+    transcribeRequestInFlight,
+    transcribeBufferDisplaySec,
+    transcribeDebug.analysisCount,
+    liveDisplayProgressionChips.length,
+  ]);
+
+  const downloadTranscribeSnapshot = useCallback(() => {
+    const inputModeLabel =
+      LIVE_INPUT_MODE_OPTIONS.find((o) => o.value === liveInputMode)?.label ?? liveInputMode;
+    const keyStabilityWord =
+      transcribeKey?.label &&
+      transcribeKey.label !== "—" &&
+      typeof transcribeKey.confidence === "number" &&
+      transcribeKey.confidence > 0
+        ? confidenceLevel(transcribeKey.confidence)
+        : null;
+    const snap = buildLiveTranscribeSnapshot({
+      sessionId: transcribeSessionId,
+      likelyKey: transcribeKey,
+      keyStabilityWord,
+      mainProgressionLabels: liveDisplayProgressionChips,
+      progressionIsLikelyLoop:
+        liveDerivedProgression.chipLabels.length > 0 ? liveDerivedProgression.isLikelyLoop : false,
+      progressionQualityLabel: liveDisplayProgressionUi.qualityPrimary,
+      formatChordLabel: (l) => liveChordLabelForDisplay(l),
+      recentSegments: transcribeRecentTimeline.map((s) => ({ t0: s.t0, t1: s.t1, label: s.label })),
+      summary: transcribeSummary?.trim() || null,
+      currentChord: transcribeCurrentChordForUi,
+      currentChordNotes: transcribeCurrentNotesForUi,
+      inputMode: liveInputMode,
+      inputModeLabel,
+      inputBoost: liveInputBoost,
+      displayTransposeSemitones,
+    });
+    downloadLiveTranscribeSnapshotJson(snap);
+  }, [
+    liveInputMode,
+    liveInputBoost,
+    transcribeSessionId,
+    transcribeKey,
+    liveDisplayProgressionChips,
+    liveDerivedProgression.chipLabels.length,
+    liveDerivedProgression.isLikelyLoop,
+    liveDisplayProgressionUi.qualityPrimary,
+    transcribeRecentTimeline,
+    transcribeSummary,
+    transcribeCurrentChordForUi,
+    transcribeCurrentNotesForUi,
+    liveChordLabelForDisplay,
+    displayTransposeSemitones,
+  ]);
+
+  const copyTranscribeProgression = useCallback(async () => {
+    const labels = liveDisplayProgressionChips;
+    if (!labels.length) {
+      return;
+    }
+    const text = labels.map((l) => liveChordLabelForDisplay(l)).join(" → ");
+    const ok = await copyTextToClipboard(text);
+    if (!ok) {
+      setError("Could not copy progression to the clipboard.");
+      return;
+    }
+    setError(null);
+    if (transcribeCopyDoneTimerRef.current != null) {
+      clearTimeout(transcribeCopyDoneTimerRef.current);
+    }
+    setTranscribeCopyFlash(true);
+    transcribeCopyDoneTimerRef.current = setTimeout(() => {
+      setTranscribeCopyFlash(false);
+      transcribeCopyDoneTimerRef.current = null;
+    }, 2000);
+  }, [liveDisplayProgressionChips, liveChordLabelForDisplay]);
+
+  const transcribeInputQuiet = useMemo(() => {
+    if (!recording || liveExperienceMode !== "transcribe") {
+      return false;
+    }
+    return liveDebug.lastRawSampleRms < 0.008 && liveDebug.lastBoostedSampleRms < 0.025;
+  }, [recording, liveExperienceMode, liveDebug.lastRawSampleRms, liveDebug.lastBoostedSampleRms]);
+
+  const transcribeQuietSuggestUpload = useMemo(() => {
+    if (!transcribeInputQuiet) {
+      return false;
+    }
+    const maxBoost = LIVE_INPUT_BOOST_OPTIONS[LIVE_INPUT_BOOST_OPTIONS.length - 1] ?? 8;
+    return liveInputBoost >= maxBoost;
+  }, [transcribeInputQuiet, liveInputBoost]);
+
+  const liveStartLabel = liveExperienceMode === "transcribe" ? "Start listening" : "Start recording";
+
+  const liveStopLabel = "Stop";
+
   return (
     <main className={`demo${appMode === "file" ? " demo--file" : ""}`}>
       <header className="hero">
         <h1>Chord lab</h1>
-        <p className="hero-sub">Live microphone or full-track analysis</p>
-        <div className="mode-toggle" role="tablist" aria-label="Mode">
+        <p className="hero-sub">Learn from a recording, or listen in with the mic</p>
+        <div className="mode-toggle mode-toggle--primary" role="tablist" aria-label="App mode">
           <button
             type="button"
             role="tab"
@@ -1278,7 +2638,7 @@ export default function Home() {
             className={appMode === "live" ? "active" : ""}
             onClick={() => setAppMode("live")}
           >
-            Live microphone
+            Listen live
           </button>
           <button
             type="button"
@@ -1287,21 +2647,152 @@ export default function Home() {
             className={appMode === "file" ? "active" : ""}
             onClick={() => setAppMode("file")}
           >
-            Analyze file
+            Learn from audio
           </button>
         </div>
+        <p className="mode-intro" role="note">
+          {appMode === "file"
+            ? "Best for a full song: upload a take to get the clearest chart, main progression, practice parts, and loops."
+            : "Quick checks and rough sketches from the mic. For the most accurate chart of a recording, use Learn from audio."}
+        </p>
       </header>
 
       {appMode === "live" ? (
         <>
-          <div className="controls">
-            <button type="button" onClick={() => void startRecording()} disabled={recording}>
-              Start Recording
+          <div className="mode-toggle live-experience-toggle" role="tablist" aria-label="Live listening mode">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={liveExperienceMode === "instant"}
+              className={liveExperienceMode === "instant" ? "active" : ""}
+              disabled={recording}
+              onClick={() => setLiveExperienceMode("instant")}
+            >
+              Instant chord check
             </button>
-            <button type="button" onClick={() => void stopRecording()} disabled={!recording}>
-              Stop Recording
+            <button
+              type="button"
+              role="tab"
+              aria-selected={liveExperienceMode === "transcribe"}
+              className={liveExperienceMode === "transcribe" ? "active" : ""}
+              disabled={recording}
+              onClick={() => setLiveExperienceMode("transcribe")}
+            >
+              Live song transcription
             </button>
           </div>
+
+          <p className="live-experience-copy" role="note">
+            {liveExperienceMode === "instant"
+              ? "Fastest read — aim the mic at your own instrument to check what you are playing."
+              : "Rough live progression from the room — great for rehearsal, speakers, or a band. Not as exact as uploading the track."}
+          </p>
+
+          <div className="controls">
+            <label className="live-mic-device-label">
+              <span className="visually-hidden">Microphone device</span>
+              <select
+                className="live-mic-device-select"
+                value={liveMicDeviceId}
+                onChange={(e) => setLiveMicDeviceId(e.target.value)}
+                disabled={recording}
+                aria-label="Microphone device"
+              >
+                <option value="">Default microphone</option>
+                {liveAudioInputs.map((d) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button type="button" onClick={() => void startRecording()} disabled={recording}>
+              {liveStartLabel}
+            </button>
+            <button type="button" onClick={() => void stopRecording()} disabled={!recording}>
+              {liveStopLabel}
+            </button>
+          </div>
+
+          <div className="live-input-mode">
+            <label className="live-input-mode-label" htmlFor="live-input-mode-select">
+              Sound source
+            </label>
+            <select
+              id="live-input-mode-select"
+              className="live-input-mode-select"
+              value={liveInputMode}
+              onChange={(e) => setLiveInputMode(e.target.value as LiveInputMode)}
+              disabled={recording}
+              aria-label="Live microphone input sensitivity"
+            >
+              {LIVE_INPUT_MODE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <p className="live-input-mode-hint">
+              {LIVE_INPUT_MODE_OPTIONS.find((o) => o.value === liveInputMode)?.hint}
+              {liveExperienceMode === "transcribe" ? (
+                <span className="live-debug-muted">
+                  {" "}
+                  Transcription works best on the <strong>Speaker / room</strong> input — you can still switch if needed.
+                </span>
+              ) : null}
+            </p>
+          </div>
+
+          <div className="live-input-mode">
+            <label className="live-input-mode-label" htmlFor="live-input-boost-select">
+              Input boost
+            </label>
+            <select
+              id="live-input-boost-select"
+              className="live-input-mode-select"
+              value={liveInputBoost}
+              onChange={(e) => {
+                liveBoostUserTouchedRef.current = true;
+                setLiveInputBoost(Number(e.target.value));
+              }}
+              disabled={recording}
+              aria-label="Microphone input boost for analysis"
+            >
+              {LIVE_INPUT_BOOST_OPTIONS.map((n) => (
+                <option key={n} value={n}>
+                  {n}×
+                </option>
+              ))}
+            </select>
+            <p className="live-input-mode-hint">
+              Use higher boost for quiet phone/speaker audio. Only the audio sent for chord detection is boosted — not
+              your speakers.
+            </p>
+          </div>
+
+          {liveExperienceMode === "instant" && liveInputMode === "song" ? (
+            <div className="live-song-playback-notice" role="note">
+              <p className="live-song-playback-notice-text">
+                Song playback mode is experimental. For best accuracy, switch to <strong>Learn from audio</strong> and upload
+                the track.
+              </p>
+              <button type="button" className="live-analyze-instead-btn" onClick={() => setAppMode("file")}>
+                Analyze a file instead
+              </button>
+            </div>
+          ) : null}
+
+          {liveExperienceMode === "transcribe" ? (
+            <div className="live-transcribe-honesty" role="note">
+              <p className="live-transcribe-honesty-text">
+                Live transcription works best with clear harmony in the room — handy for rehearsal or jotting a rough chart.{" "}
+                <strong>For a precise chart, use Learn from audio.</strong>
+              </p>
+              <button type="button" className="live-analyze-instead-btn" onClick={() => setAppMode("file")}>
+                Open Learn from audio
+              </button>
+            </div>
+          ) : null}
 
           {status ? (
             <p className="status-line" role="status">
@@ -1314,76 +2805,492 @@ export default function Home() {
             </p>
           ) : null}
 
-          <section className="chord-stage" aria-live="polite" aria-atomic="true">
-            <p className="chord-stage-label">Current chord</p>
-            <p className={chordValueClass}>{chordDisplay.text}</p>
-            {confidence !== null && chord !== null ? (
-              <p className="chord-stage-confidence chord-stage-confidence--soft">
-                {confidenceLevel(confidence)} confidence in this chord
+          {transcribeInputQuiet ? (
+            <div className="live-transcribe-quiet-warning" role="status">
+              <p className="live-transcribe-quiet-warning-text">
+                Input is quiet — move the source closer, raise volume, or increase input boost.
               </p>
-            ) : null}
-          </section>
-
-          <section className="details details--live" aria-label="Key">
-            <div className="detail-grid">
-              <div className="detail-block">
-                <span className="detail-label">Song key</span>
-                <span className="detail-value">{key}</span>
-              </div>
-              {keyConfidence !== null && key !== "—" ? (
-                <div className="detail-block">
-                  <span className="detail-label">Key (best guess)</span>
-                  <span className="detail-value">{confidenceLevel(keyConfidence)}</span>
-                </div>
+              {transcribeQuietSuggestUpload ? (
+                <p className="live-transcribe-quiet-warning-more">
+                  Input is still low at max boost — try uploading the track under <strong>Learn from audio</strong> for the
+                  clearest readout.
+                </p>
               ) : null}
             </div>
-          </section>
+          ) : null}
 
-          <section className="history-section" aria-label="Chord history">
-            <h2 className="section-title">Chord history</h2>
-            {chordHistory.length === 0 ? (
-              <p className="history-empty">Recent chords appear here as they change.</p>
-            ) : (
-              <ol className="history-list" aria-label="Recent chords, newest first">
-                {chordHistory.map((c, i) => (
-                  <li key={`${c}-${i}`}>{c}</li>
-                ))}
-              </ol>
-            )}
-          </section>
+          {liveExperienceMode === "instant" ? (
+            <>
+              <section className="chord-stage" aria-live="polite" aria-atomic="true">
+                <p className="chord-stage-label">Current chord</p>
+                <p className={chordValueClass}>{chordDisplay.text}</p>
+                {confidence !== null && chord !== null ? (
+                  <p className="chord-stage-confidence chord-stage-confidence--soft">
+                    Read strength: {readStrengthLabel(confidence)}
+                  </p>
+                ) : null}
+                {liveInstantChordTonesLine ? (
+                  <p className="chord-stage-confidence chord-stage-confidence--soft">
+                    Chord tones: {liveInstantChordTonesLine}
+                  </p>
+                ) : null}
+              </section>
 
-          {liveTraceUI ? (
-            <details className="live-debug-panel">
-              <summary>Live debug (remove ?liveDebug=1 or env flag for production)</summary>
+              <section className="details details--live" aria-label="Key">
+                <div className="detail-grid">
+                  <div className="detail-block">
+                    <span className="detail-label">Likely key</span>
+                    <span className="detail-value">{key}</span>
+                  </div>
+                  {keyConfidence !== null && key !== "—" ? (
+                    <div className="detail-block">
+                      <span className="detail-label">Key read</span>
+                      <span className="detail-value">{readStrengthLabel(keyConfidence)}</span>
+                    </div>
+                  ) : null}
+                </div>
+              </section>
+
+              <section className="history-section" aria-label="Chord history">
+                <h2 className="section-title">Recent chords</h2>
+                {chordHistory.length === 0 ? (
+                  <p className="history-empty">Recent chords show up here as they change.</p>
+                ) : (
+                  <ol className="history-list" aria-label="Recent chords, newest first">
+                    {chordHistory.map((c, i) => (
+                      <li key={`${c}-${i}`}>{c}</li>
+                    ))}
+                  </ol>
+                )}
+              </section>
+            </>
+          ) : (
+            <>
+              <section className="live-transcribe-panel" aria-live="polite">
+                <h2 className="live-transcribe-title">Live sketch</h2>
+                <p className="live-transcribe-dek">
+                  Rough progression from the room — try these chords first. For a precise chart,{" "}
+                  <button type="button" className="text-link-btn" onClick={() => setAppMode("file")}>
+                    learn from an audio file
+                  </button>
+                  .
+                </p>
+                <p className="live-transcribe-status" role="status">
+                  {transcribeLiveStatus.headline}
+                </p>
+                {transcribeLiveStatus.sub ? (
+                  <p className="live-transcribe-status-sub">{transcribeLiveStatus.sub}</p>
+                ) : null}
+
+                <div className="detail-grid detail-grid--transcribe">
+                  <div className="detail-block">
+                    <span className="detail-label">Likely song key</span>
+                    <span className="detail-value">{transcribeKey?.label ?? "—"}</span>
+                  </div>
+                  {transcribeKey?.label != null &&
+                  transcribeKey.label !== "—" &&
+                  typeof transcribeKey.confidence === "number" &&
+                  transcribeKey.confidence > 0 ? (
+                    <div className="detail-block">
+                      <span className="detail-label">Key stability</span>
+                      <span className="detail-value">{readStrengthLabel(transcribeKey.confidence)}</span>
+                    </div>
+                  ) : null}
+                </div>
+
+                <TransposeDisplayControl
+                  id="live-transpose"
+                  value={displayTransposeSemitones}
+                  onChange={setDisplayTransposeSemitones}
+                />
+
+                <section className="chord-stage chord-stage--transcribe" aria-label="Current harmony">
+                  <p className="chord-stage-label">Latest chord</p>
+                  <p
+                    className={
+                      transcribeCurrentChord !== "—" ? "chord-stage-value" : "chord-stage-value chord-stage-placeholder"
+                    }
+                  >
+                    {transcribeCurrentChordForUi}
+                  </p>
+                  {transcribeCurrentNotesForUi.length ? (
+                    <p className="chord-stage-confidence chord-stage-confidence--soft">
+                    Suggested notes: {transcribeCurrentNotesForUi.join(" · ")}
+                  </p>
+                  ) : (
+                    <p className="chord-stage-confidence chord-stage-confidence--soft">
+                      Slight lag behind what you hear — a harmonic hint, not a finished chart.
+                    </p>
+                  )}
+                </section>
+
+                <div className="live-transcribe-practice">
+                  <div className="live-progression-header-row">
+                    <h3 className="live-transcribe-subhead live-progression-heading">Main progression</h3>
+                    {liveDerivedProgression.chipLabels.length > 0 && liveDerivedProgression.isLikelyLoop ? (
+                      <span className="live-progression-badge" title="Repeated pattern detected in recent harmony">
+                        Likely loop
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="live-transcribe-actions" role="group" aria-label="Transcription snapshot actions">
+                    <button type="button" className="live-transcribe-action-btn" onClick={() => downloadTranscribeSnapshot()}>
+                      Download snapshot
+                    </button>
+                    <button
+                      type="button"
+                      className="live-transcribe-action-btn"
+                      onClick={() => void copyTranscribeProgression()}
+                      disabled={liveDisplayProgressionChips.length === 0}
+                      title={
+                        liveDisplayProgressionChips.length === 0
+                          ? "Listen a bit longer to build a progression first"
+                          : undefined
+                      }
+                    >
+                      Copy progression
+                    </button>
+                    {transcribeCopyFlash ? (
+                      <span className="live-transcribe-copied" role="status" aria-live="polite">
+                        Copied
+                      </span>
+                    ) : null}
+                    <button type="button" className="live-transcribe-action-btn" onClick={() => clearTranscribeSession()}>
+                      Clear session
+                    </button>
+                  </div>
+                  {liveDisplayProgressionChips.length === 0 ? (
+                    <p className="live-transcribe-actions-hint muted-hint">
+                      Chords will appear here after a few seconds — then you can copy or save a snapshot.
+                    </p>
+                  ) : null}
+                  <p className="live-progression-quality" role="status">
+                    {liveDisplayProgressionUi.qualityPrimary}
+                  </p>
+                  {liveDisplayProgressionUi.qualitySecondary ? (
+                    <p className="live-progression-pattern-hint">{liveDisplayProgressionUi.qualitySecondary}</p>
+                  ) : null}
+                  {(liveDerivedProgression.showPatternHint && liveDerivedProgression.chipLabels.length > 0) ||
+                  (liveDisplayProgressionChips.length > 0 &&
+                    liveDisplayProgressionChips.length < 2 &&
+                    liveDerivedProgression.chipLabels.length === 0) ? (
+                    <p className="live-progression-pattern-hint">Still listening for the pattern…</p>
+                  ) : null}
+                  {liveDisplayProgressionChips.length > 0 ? (
+                    <div className="live-progression-chips" aria-label="Main progression chords to try first">
+                      {liveDisplayProgressionChips.map((lab, i) => (
+                        <Fragment key={`${lab}-${i}`}>
+                          {i > 0 ? (
+                            <span className="live-progression-arrow" aria-hidden>
+                              →
+                            </span>
+                          ) : null}
+                          <span className="live-progression-chip">{liveChordLabelForDisplay(lab)}</span>
+                        </Fragment>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="live-transcribe-progression-line live-transcribe-progression-line--empty">
+                      Still listening for the progression…
+                    </p>
+                  )}
+                  {liveDisplayProgressionChips.length > 0 && transcribeKey?.label && transcribeKey.label !== "—" ? (
+                    <p className="live-transcribe-loop-hint">
+                      Try these in <strong>{transcribeKey.label}</strong> if that feels right — the fine timeline below is
+                      reference only.
+                    </p>
+                  ) : null}
+                  {transcribeSummary ? <p className="live-transcribe-summary">{transcribeSummary}</p> : null}
+                </div>
+
+                <details className="live-transcribe-timeline-details">
+                  <summary className="live-transcribe-timeline-summary">Fine-grained timeline (optional)</summary>
+                  <div className="live-transcribe-timeline live-transcribe-timeline--secondary">
+                    <p className="live-transcribe-timeline-lead">
+                      Shorter slices from roughly the last {TRANSCRIBE_TIMELINE_KEEP_SEC}s — for cross-checking, not for
+                      practicing the main row.
+                    </p>
+                    {transcribeRecentTimeline.length === 0 ? (
+                      <p className="history-empty">Segments appear after the listener has analyzed a few windows.</p>
+                    ) : (
+                      <ul className="live-transcribe-timeline-list" aria-label="Recent chords in time order">
+                        {transcribeRecentTimeline.map((s, i) => (
+                          <li key={`${s.label}-${s.t0}-${i}`}>
+                            <span className="live-transcribe-timeline-span">
+                              {s.t0.toFixed(1)}s–{s.t1.toFixed(1)}s
+                            </span>{" "}
+                            <strong>{liveChordLabelForDisplay(s.label)}</strong>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </details>
+              </section>
+            </>
+          )}
+
+          <details className="live-debug-panel">
+            <summary>
+              Diagnostics{" "}
+              <span className="live-debug-summary-hint">for troubleshooting</span>
+            </summary>
+            <p className="live-debug-lead">
+              Open while recording if the readout freezes. Verbose browser logs: add <code>?liveDebug=1</code> to the page
+              URL or set <code>NEXT_PUBLIC_LIVE_MIC_DEBUG=1</code>.
+            </p>
+            <dl className="live-debug-dl">
+              <dt>POST endpoint</dt>
+              <dd>
+                <code>
+                  {liveExperienceMode === "transcribe"
+                    ? `${API_BASE}/live-transcribe (rolling ~${TRANSCRIBE_WINDOW_SEC}s)`
+                    : `${API_BASE}/stream?mode=${liveInputMode}`}
+                </code>
+              </dd>
+              <dt>Live input mode (UI selector)</dt>
+              <dd>
+                <code>{liveInputMode}</code>
+              </dd>
+              <dt>Preset (last response)</dt>
+              <dd>
+                <code>{liveDebug.lastStreamInputMode}</code> — {liveDebug.lastStreamPresetName}
+              </dd>
+              <dt>WAV chunk length (this mode)</dt>
+              <dd>
+                {liveExperienceMode === "transcribe" ? (
+                  <>
+                    Rolling buffer up to {TRANSCRIBE_RING_MAX_SEC}s · analyze ~{TRANSCRIBE_WINDOW_SEC}s · every{" "}
+                    {TRANSCRIBE_INTERVAL_SEC}s
+                    <span className="live-debug-muted"> (no /stream chunks in this mode)</span>
+                  </>
+                ) : (
+                  <>
+                    {liveChunkSeconds} s <span className="live-debug-muted">(song uses shorter chunks for lower latency)</span>
+                  </>
+                )}
+              </dd>
+              <dt>Latency hint (wall clock)</dt>
+              <dd>
+                since last chunk sent: {formatMsOptional(liveDebug.msSinceLastChunkSent)} · since last /stream response:{" "}
+                {formatMsOptional(liveDebug.msSinceLastStreamResponse)}{" "}
+                <span className="live-debug-muted">(updated ~250ms while recording)</span>
+              </dd>
+              <dt>Preset tuning (last response)</dt>
+              <dd>
+                weak_confirm={liveDebug.lastPresetWeakConfirmChunks ?? "—"} · silence_clear=
+                {liveDebug.lastPresetSilenceStreakClear ?? "—"} · invalid_clear=
+                {liveDebug.lastPresetInvalidStreakClear ?? "—"}
+              </dd>
+              <dt>Key: instant raw / conf (chunk)</dt>
+              <dd>
+                <code>{liveDebug.lastStreamInstantKeyRaw}</code> ·{" "}
+                {formatOptionalFloat(liveDebug.lastStreamInstantKeyConf, 3)}
+              </dd>
+              <dt>Key: smoothed internal (session state)</dt>
+              <dd>
+                <code>{liveDebug.lastStreamSmoothedKeyRaw}</code>
+              </dd>
+              <dt>Key display source</dt>
+              <dd>
+                <code>{liveDebug.lastStreamKeyDisplaySource}</code>
+              </dd>
+              <dt>Held last valid chord</dt>
+              <dd>
+                {liveDebug.lastStreamHeldLastValid != null ? String(liveDebug.lastStreamHeldLastValid) : "—"}
+              </dd>
+              <dt>Chord commit (last)</dt>
+              <dd>
+                <code>{liveDebug.lastStreamChordCommitKind}</code>
+                <span className="live-debug-muted"> · displayed </span>
+                <code>{liveDebug.lastStreamDisplayedChord}</code>
+              </dd>
+              <dt>Backend raw / final chord (last)</dt>
+              <dd>
+                <code>{liveDebug.lastBackendRaw}</code> → <code>{liveDebug.lastBackendFinalChord}</code>
+              </dd>
+              <dt>Mic permission (this session)</dt>
+              <dd>{liveDebug.micPermission}</dd>
+              <dt>Browser mic permission</dt>
+              <dd>
+                {liveDebug.browserMicPermission}{" "}
+                <span className="live-debug-muted">(Permissions API; may stay &quot;prompt&quot; until Start)</span>
+              </dd>
+              <dt>AudioContext state</dt>
+              <dd>{liveDebug.audioContextState}</dd>
+              <dt>Audio processing (ScriptProcessor)</dt>
+              <dd>{liveAudioProcessingSummary}</dd>
+              <dt>InputBuffer channels (telemetry)</dt>
+              <dd>{liveDebug.lastInputBufferChannels || "—"}</dd>
+              <dt>Audio tracks / label</dt>
+              <dd>
+                {liveDebug.trackCount} · {liveDebug.trackLabel}
+              </dd>
+              <dt>Track enabled / muted / readyState</dt>
+              <dd>
+                {String(liveDebug.trackEnabled)} / {String(liveDebug.trackMuted)} / {liveDebug.trackReadyState}
+              </dd>
+              <dt>getSettings() — deviceId</dt>
+              <dd>
+                <code>{liveDebug.trackDeviceId}</code>
+              </dd>
+              <dt>getSettings() — sampleRate / channelCount</dt>
+              <dd>
+                {liveDebug.trackSampleRate} / {liveDebug.trackChannelCount}
+              </dd>
+              <dt>getSettings() — echo / noise / AGC</dt>
+              <dd>
+                {liveDebug.trackEchoCancellation} / {liveDebug.trackNoiseSuppression} /{" "}
+                {liveDebug.trackAutoGainControl}
+              </dd>
+              <dt>Input boost (WAV / analysis path)</dt>
+              <dd>
+                {liveInputBoost}× <span className="live-debug-muted">(not applied to speaker output)</span>
+              </dd>
+              <dt>Raw mono peak / RMS (pre-boost)</dt>
+              <dd>
+                {formatLivePeakRms(liveDebug.lastRawSamplePeak, liveDebug.lastRawSampleRms)}{" "}
+                <span className="live-debug-muted">(telemetry ~220ms)</span>
+              </dd>
+              <dt>Boosted mono peak / RMS (pre-WAV, clamped)</dt>
+              <dd>{formatLivePeakRms(liveDebug.lastBoostedSamplePeak, liveDebug.lastBoostedSampleRms)}</dd>
+              <dt>Clipping (last telemetry buffer)</dt>
+              <dd>
+                {liveDebug.lastBoostClipFraction > 0
+                  ? `yes — ${(liveDebug.lastBoostClipFraction * 100).toFixed(2)}% of samples hit ±1 clamp`
+                  : "no"}
+              </dd>
+              <dt>Chunks created (WAV emitted)</dt>
+              <dd>{liveDebug.chunksCreated}</dd>
+              <dt>Chunks posted (HTTP 200 + JSON parsed)</dt>
+              <dd>{liveDebug.chunksPosted}</dd>
+              <dt>Responses applied (to UI)</dt>
+              <dd>{liveDebug.responsesApplied}</dd>
+              <dt>Last WAV blob size</dt>
+              <dd>{liveDebug.lastChunkSize > 0 ? `${liveDebug.lastChunkSize} B (${formatBytes(liveDebug.lastChunkSize)})` : "—"}</dd>
+              <dt>Last HTTP status</dt>
+              <dd>{liveDebug.lastHttpStatus != null ? liveDebug.lastHttpStatus : "—"}</dd>
+              <dt>Last upload / response line</dt>
+              <dd>{liveDebug.lastUploadStatus}</dd>
+              <dt>Last backend chord / raw</dt>
+              <dd>
+                {liveDebug.lastBackendChord} / {liveDebug.lastBackendRaw}
+              </dd>
+              <dt>Backend rejection / gating</dt>
+              <dd>
+                <code>{liveDebug.lastStreamRejectionReason}</code>
+                {liveDebug.lastBackendAccepted != null ? (
+                  <>
+                    {" "}
+                    · accepted={String(liveDebug.lastBackendAccepted)}
+                    {liveDebug.lastBackendClearDisplay != null
+                      ? ` · clear_display=${String(liveDebug.lastBackendClearDisplay)}`
+                      : ""}
+                  </>
+                ) : null}
+              </dd>
+              <dt>Backend waveform RMS / peak (chunk)</dt>
+              <dd>
+                {formatOptionalFloat(liveDebug.lastBackendWaveformRms, 6)} /{" "}
+                {formatOptionalFloat(liveDebug.lastBackendWaveformPeak, 6)}
+              </dd>
+              <dt>Template scores: best / second / margin</dt>
+              <dd>
+                {formatOptionalFloat(liveDebug.lastBackendBestScore, 3)} / {formatOptionalFloat(liveDebug.lastBackendSecondScore, 3)}{" "}
+                / {formatOptionalFloat(liveDebug.lastBackendTemplateMargin, 3)}
+              </dd>
+              <dt>Chroma: entropy / stability / strong bins</dt>
+              <dd>
+                {formatOptionalFloat(liveDebug.lastBackendChromaEntropy, 3)} /{" "}
+                {formatOptionalFloat(liveDebug.lastBackendChromaStability, 3)} /{" "}
+                {liveDebug.lastBackendStrongChromaBins != null ? liveDebug.lastBackendStrongChromaBins : "—"}
+              </dd>
+              <dt>Final chord (after gating, matches response)</dt>
+              <dd>
+                <code>{liveDebug.lastBackendFinalChord}</code> · silence_flag{" "}
+                {liveDebug.lastBackendSilenceFlag != null ? String(liveDebug.lastBackendSilenceFlag) : "—"}
+              </dd>
+              <dt>Ignored / disposition</dt>
+              <dd>{liveDebug.ignoredResponseReason}</dd>
+              <dt>Last fetch / HTTP body error</dt>
+              <dd>{liveDebug.lastFetchError}</dd>
+              <dt>Last UI error (alert line)</dt>
+              <dd>{liveDebug.lastUiError}</dd>
+            </dl>
+          </details>
+
+          {liveExperienceMode === "transcribe" ? (
+            <details className="live-debug-panel live-debug-panel--transcribe">
+              <summary>
+                Transcription timing <span className="live-debug-summary-hint">technical</span>
+              </summary>
+              <div className="live-debug-toolbar-row muted-hint">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={transcribeServerDebug}
+                    onChange={(e) => setTranscribeServerDebug(e.target.checked)}
+                  />{" "}
+                  Request <code>debug=true</code> on <code>/live-transcribe</code> (server diagnostics)
+                </label>
+              </div>
               <dl className="live-debug-dl">
-                <dt>API</dt>
+                <dt>Last core empty reason (server)</dt>
                 <dd>
-                  <code>{API_BASE}</code>/stream
+                  <code>{transcribeDebug.lastLtCoreEmptyReason}</code>
                 </dd>
-                <dt>Mic permission</dt>
-                <dd>{liveDebug.micPermission}</dd>
-                <dt>AudioContext</dt>
-                <dd>{liveDebug.audioContextState}</dd>
-                <dt>Chunks created (WAV)</dt>
-                <dd>{liveDebug.chunksCreated}</dd>
-                <dt>Responses applied</dt>
-                <dd>{liveDebug.chunksSent}</dd>
-                <dt>Last chunk size</dt>
-                <dd>{liveDebug.lastChunkSize} B</dd>
-                <dt>Input peak / RMS (throttled)</dt>
+                <dt>Runs-for-core strategy (server)</dt>
                 <dd>
-                  {liveDebug.lastSamplePeak.toFixed(4)} / {liveDebug.lastSampleRms.toFixed(5)}
+                  <code>{transcribeDebug.lastLtRunsForCoreStrategy}</code>
                 </dd>
-                <dt>Last upload</dt>
-                <dd>{liveDebug.lastUploadStatus}</dd>
-                <dt>Backend chord / raw</dt>
+                <dt>Progression source / quality (API)</dt>
                 <dd>
-                  {liveDebug.lastBackendChord} / {liveDebug.lastBackendRaw}
+                  <code>{transcribeDebug.lastProgressionSource}</code> · <code>{transcribeDebug.lastProgressionQuality}</code>
                 </dd>
-                <dt>Ignored reason</dt>
-                <dd>{liveDebug.ignoredResponseReason}</dd>
-                <dt>Backend error</dt>
-                <dd>{liveDebug.lastBackendError}</dd>
+                <dt>Segment counts (server debug)</dt>
+                <dd>{transcribeDebug.lastLtServerSegmentSummary}</dd>
+                <dt>Client merged timeline seg count (echo)</dt>
+                <dd>{transcribeDebug.lastLtClientTimelineSegEcho}</dd>
+                <dt>First analysis threshold (min buffer, s)</dt>
+                <dd>{FIRST_TRANSCRIBE_AFTER_SEC}</dd>
+                <dt>Analysis window (max slice, s)</dt>
+                <dd>{TRANSCRIBE_WINDOW_SEC}</dd>
+                <dt>Analysis interval (s)</dt>
+                <dd>{TRANSCRIBE_INTERVAL_SEC}</dd>
+                <dt>Min audio slice before POST (s)</dt>
+                <dd>{MIN_TRANSCRIBE_AUDIO_SEC}</dd>
+                <dt>Current rolling buffer (s, polled)</dt>
+                <dd>{transcribeBufferDisplaySec.toFixed(2)}</dd>
+                <dt>Last request round-trip (ms)</dt>
+                <dd>{transcribeDebug.lastRequestDurationMs != null ? transcribeDebug.lastRequestDurationMs : "—"}</dd>
+                <dt>Last response <code>status</code> field</dt>
+                <dd>
+                  <code>{transcribeDebug.lastAnalysisStatus}</code>
+                </dd>
+                <dt>Request in flight</dt>
+                <dd>{String(transcribeRequestInFlight)}</dd>
+                <dt>Session id</dt>
+                <dd>
+                  <code>{transcribeSessionId || "—"}</code>
+                </dd>
+                <dt>Ring buffered (last cycle, s)</dt>
+                <dd>{transcribeDebug.ringBufferedSec.toFixed(2)}</dd>
+                <dt>Last WAV window sent (s)</dt>
+                <dd>{transcribeDebug.lastWindowSec.toFixed(2)}</dd>
+                <dt>ScriptProcessor callbacks (see main Live debug)</dt>
+                <dd>{liveDebug.audioProcessCallbacks}</dd>
+                <dt>Last raw peak / RMS (telemetry)</dt>
+                <dd>{formatLivePeakRms(transcribeDebug.lastRawPeak, transcribeDebug.lastRawRms)}</dd>
+                <dt>Last HTTP outcome</dt>
+                <dd>{transcribeDebug.lastRequestStatus}</dd>
+                <dt>Analyses completed (applied)</dt>
+                <dd>{transcribeDebug.analysisCount}</dd>
+                <dt>Last key (raw from server)</dt>
+                <dd>{transcribeDebug.lastKeyLabel}</dd>
+                <dt>Last core progression line</dt>
+                <dd>{transcribeDebug.lastProgression}</dd>
+                <dt>Last error</dt>
+                <dd>{transcribeDebug.lastError}</dd>
               </dl>
             </details>
           ) : null}
@@ -1391,9 +3298,10 @@ export default function Home() {
       ) : (
         <section className="analyze-panel" aria-label="File analysis">
           <header className="analyze-panel-header">
-            <h2>Practice with a recording</h2>
+            <h2>Learn from audio</h2>
             <p className="analyze-lead">
-              Load a track, follow the big chords, then use practice controls to loop and slow down until it sticks.
+              Upload a recording for the best chord chart. Follow the main progression, then loop sections and slow the tempo
+              until it feels easy.
             </p>
           </header>
 
@@ -1413,18 +3321,25 @@ export default function Home() {
               onClick={() => void runAnalyze()}
               disabled={!analyzeFile || analyzeLoading}
             >
-              {analyzeLoading ? "Analyzing…" : "Run analysis"}
+              {analyzeLoading ? "Working…" : "Analyze"}
             </button>
+            <label className="muted-hint analyze-debug-api-label">
+              <input
+                type="checkbox"
+                checked={analyzeQueryDebug}
+                onChange={(e) => setAnalyzeQueryDebug(e.target.checked)}
+              />{" "}
+              Include <code>debug</code> in API response
+            </label>
           </div>
 
           {analyzeLoading ? (
             <div className="analyze-processing" role="status" aria-live="polite" aria-busy="true">
               <div className="analyze-spinner" aria-hidden />
               <div className="analyze-processing-body">
-                <strong className="analyze-processing-title">Working on your track</strong>
+                <strong className="analyze-processing-title">Analyzing your track</strong>
                 <p className="analyze-processing-detail">
-                  Longer files take longer. There is no percentage bar because the server does not stream fine-grained
-                  progress—the steps below are <strong>illustrative</strong> and may overlap in time.
+                  Longer files take longer. The list below is a rough guide — the server may finish steps in a different order.
                 </p>
                 <ol className="analyze-stage-list" aria-label="Analysis stages (illustrative)">
                   {ANALYZE_STAGE_MESSAGES.map((step, i) => (
@@ -1463,7 +3378,7 @@ export default function Home() {
           {analyzeResult ? (
             <>
             <div className="analyze-song-summary" aria-label="Song summary">
-                <h3 className="analyze-song-summary-title">Your track</h3>
+                <h3 className="analyze-song-summary-title">This track</h3>
                 <p className="analyze-song-summary-name">{analyzeFileName ?? "Song"}</p>
                 <div className="analyze-song-summary-stats">
                   <div className="analyze-song-stat">
@@ -1488,21 +3403,34 @@ export default function Home() {
                     </p>
                   </div>
                 ) : null}
+                <TransposeDisplayControl
+                  id="analyze-transpose"
+                  value={displayTransposeSemitones}
+                  onChange={setDisplayTransposeSemitones}
+                />
+                {analyzeResult.debug && typeof analyzeResult.debug === "object" ? (
+                  <details className="analyze-api-debug">
+                    <summary className="muted-hint">Server analysis debug (requested)</summary>
+                    <pre className="analyze-api-debug-pre">{JSON.stringify(analyzeResult.debug, null, 2)}</pre>
+                  </details>
+                ) : null}
               </div>
 
               <div className="analyze-chord-rail-block analyze-chord-rail-block--core">
-                <h2 className="analyze-learning-heading">Main chord progression</h2>
+                <h2 className="analyze-learning-heading">Main progression</h2>
                 <p className="analyze-learning-lead">
-                  Big-picture harmony—tap a chord to jump to where it first appears in this track.
+                  The song in broad strokes — tap a chord to jump where it first appears in the track.
                 </p>
                 <div className="analyze-core-row" aria-label="Core chord progression">
-                  {coreProgression.length === 0 ? (
+                  {                    coreProgressionDisplay.length === 0 ? (
                     <p className="analyze-core-empty">No chord summary available for this track.</p>
                   ) : (
-                    coreProgression.map((entry, i) => {
-                      const isActive = entry.label === currentChordLabelForHighlight && entry.label !== "N";
+                    coreProgressionDisplay.map((entry, i) => {
+                      const orig = coreProgression[i];
+                      const isActive =
+                        orig.label === currentChordLabelForHighlight && orig.label !== "N";
                       return (
-                        <div className="analyze-core-slot" key={`${entry.label}-core-${i}`}>
+                        <div className="analyze-core-slot" key={`${orig.label}-core-${i}`}>
                           {i > 0 ? (
                             <span className="analyze-core-arrow" aria-hidden>
                               →
@@ -1516,12 +3444,12 @@ export default function Home() {
                             onClick={() => {
                               const el = analyzeAudioRef.current;
                               if (!el || !analyzeResult) return;
-                              const t = firstChordTimeForLabel(analyzeResult.chords, entry.label);
+                              const t = firstChordTimeForLabel(analyzeResult.chords, orig.label);
                               if (t === null) return;
                               el.currentTime = t;
                               setAnalyzePlaybackTime(t);
                             }}
-                            title={`Jump to first ${entry.label}`}
+                            title={`Jump to first ${orig.label}`}
                           >
                             {isActive ? <span className="analyze-core-now">Now</span> : null}
                             <span className="analyze-core-symbol">{entry.label}</span>
@@ -1534,7 +3462,7 @@ export default function Home() {
                 </div>
                 {analyzeResult.chords.some((c) => c.low_confidence) ? (
                   <p className="analyze-muted-foot">
-                    Some chords are best-effort guesses—use your ears when something sounds off.
+                    Some symbols are educated guesses — trust your ears if something feels off.
                   </p>
                 ) : null}
               </div>
@@ -1543,7 +3471,7 @@ export default function Home() {
                 <div className="analyze-practice-controls-card">
                   <h3 className="analyze-subhead">Practice setup</h3>
                   <p className="analyze-practice-controls-lead">
-                    Playback, tempo, and looping—get these set, then use <strong>Right now</strong> to follow the chart.
+                    Playback, speed, and loop — set this first, then use <strong>Right now</strong> to play along with the chart.
                   </p>
                   <div className="analyze-practice-transport" role="group" aria-label="Practice playback">
                     <button
@@ -1652,7 +3580,7 @@ export default function Home() {
               ) : null}
 
               <div className="analyze-practice-view-bar" role="group" aria-label="Practice view">
-                <span className="analyze-practice-view-label">How to read chords</span>
+                <span className="analyze-practice-view-label">Chart style</span>
                 <div className="analyze-practice-view-toggle">
                   <button
                     type="button"
@@ -1682,16 +3610,20 @@ export default function Home() {
               </div>
 
               <div className="analyze-practice-panel" aria-label="Right now">
-                <h3 className="analyze-subhead">Right now in the track</h3>
+                <h3 className="analyze-subhead">Right now</h3>
                 <div className="analyze-practice-grid analyze-practice-grid--two">
                   <div className="analyze-practice-cell">
                     <span className="analyze-practice-eyebrow">Current chord</span>
                     <p className="analyze-practice-chord" aria-live="polite">
-                      {chordLabelAtTime(analyzePlaybackTime, analyzeResult.chords, analyzePlaybackDuration)}
+                      {currentAnalyzeChordForUi?.label ??
+                        transposeChordLabel(
+                          chordLabelAtTime(analyzePlaybackTime, analyzeResult.chords, analyzePlaybackDuration),
+                          displayTransposeSemitones,
+                        )}
                     </p>
                     {analyzePracticeView === "piano" ? (
                       (() => {
-                        const h = getSimplePianoHands(currentAnalyzeChord);
+                        const h = getSimplePianoHands(currentAnalyzeChordForUi);
                         return (
                           <>
                             <p className="analyze-practice-piano-combo">
@@ -1708,10 +3640,10 @@ export default function Home() {
                           </>
                         );
                       })()
-                    ) : formatPlayHint(currentAnalyzeChord) ? (
-                      <p className="analyze-practice-playhint">{formatPlayHint(currentAnalyzeChord)}</p>
-                    ) : chordNotesLine(currentAnalyzeChord) !== "—" ? (
-                      <p className="analyze-practice-tones">{chordNotesLine(currentAnalyzeChord)}</p>
+                    ) : formatPlayHint(currentAnalyzeChordForUi) ? (
+                      <p className="analyze-practice-playhint">{formatPlayHint(currentAnalyzeChordForUi)}</p>
+                    ) : chordNotesLine(currentAnalyzeChordForUi) !== "—" ? (
+                      <p className="analyze-practice-tones">{chordNotesLine(currentAnalyzeChordForUi)}</p>
                     ) : null}
                     {analyzePracticeView === "chords" && currentAnalyzeChord?.low_confidence ? (
                       <p className="analyze-practice-ear">Check this one by ear</p>
@@ -1720,11 +3652,13 @@ export default function Home() {
                   <div className="analyze-practice-cell">
                     <span className="analyze-practice-eyebrow">Next chord</span>
                     <p className="analyze-practice-chord analyze-practice-chord--secondary" aria-live="polite">
-                      {nextChordCountdown ? nextChordCountdown.label : nextRunDisplay.label}
+                      {nextChordCountdown
+                        ? transposeChordLabel(nextChordCountdown.label, displayTransposeSemitones)
+                        : nextRunDisplayForUi.label}
                     </p>
-                    {analyzePracticeView === "piano" && nextRunDisplay.label !== "End of chart" ? (
+                    {analyzePracticeView === "piano" && nextRunDisplayForUi.label !== "End of chart" ? (
                       (() => {
-                        const h = getSimplePianoHands(displayedNextChordSeg);
+                        const h = getSimplePianoHands(displayedNextChordSegForUi);
                         return (
                           <>
                             <p className="analyze-practice-piano-combo">
@@ -1743,14 +3677,16 @@ export default function Home() {
                       })()
                     ) : analyzePracticeView === "chords" ? (
                       <>
-                        {displayedNextChordSeg ? (
-                          formatPlayHint(displayedNextChordSeg) ? (
-                            <p className="analyze-practice-playhint">{formatPlayHint(displayedNextChordSeg)}</p>
-                          ) : chordNotesLine(displayedNextChordSeg) !== "—" ? (
-                            <p className="analyze-practice-tones">{chordNotesLine(displayedNextChordSeg)}</p>
+                        {displayedNextChordSegForUi ? (
+                          formatPlayHint(displayedNextChordSegForUi) ? (
+                            <p className="analyze-practice-playhint">{formatPlayHint(displayedNextChordSegForUi)}</p>
+                          ) : chordNotesLine(displayedNextChordSegForUi) !== "—" ? (
+                            <p className="analyze-practice-tones">{chordNotesLine(displayedNextChordSegForUi)}</p>
                           ) : null
-                        ) : !nextChordCountdown && nextRunDisplay.notesLine && nextRunDisplay.notesLine !== "—" ? (
-                          <p className="analyze-practice-tones">{nextRunDisplay.notesLine}</p>
+                        ) : !nextChordCountdown &&
+                          nextRunDisplayForUi.notesLine &&
+                          nextRunDisplayForUi.notesLine !== "—" ? (
+                          <p className="analyze-practice-tones">{nextRunDisplayForUi.notesLine}</p>
                         ) : null}
                       </>
                     ) : null}
@@ -1865,9 +3801,9 @@ export default function Home() {
               ) : null}
 
               <div className="analyze-section-flow analyze-section-flow--compact">
-                <h3 className="analyze-subhead">Parts</h3>
+                <h3 className="analyze-subhead">Jump to a part</h3>
                 <p className="analyze-section-flow-hint analyze-section-flow-hint--short">
-                  Tap a section to jump—same chunks as in <strong>Practice setup</strong>.
+                  Same sections as in <strong>Practice setup</strong> — tap to seek.
                 </p>
                 <div className="analyze-section-nav-buttons">
                   <button
@@ -1918,14 +3854,14 @@ export default function Home() {
               </div>
 
               <details className="analyze-advanced-drawer">
-                <summary>More detail — song map, full timeline, raw analysis</summary>
+                <summary>Song map &amp; extra detail (optional)</summary>
                 <div className="analyze-advanced-inner">
                   <section className="analyze-advanced-chunk" aria-label="Song map">
                     <h4 className="analyze-advanced-h">Song map</h4>
                     <div className="analyze-timeline-block analyze-timeline-block--secondary">
                       <p className="analyze-legend analyze-legend--muted">
-                        Optional overview — click the bar to seek. For daily practice, the main progression and{" "}
-                        <strong>Right now</strong> panels above are usually enough.
+                        Overview only — click the bar to seek. Daily practice: use <strong>Main progression</strong> and{" "}
+                        <strong>Right now</strong> above.
                       </p>
                 <div className="analyze-section-ribbon" aria-label="Practice parts" role="presentation">
                   {practiceParts.map((p, i) => {
@@ -1987,9 +3923,9 @@ export default function Home() {
                               c.low_confidence ? " analyze-chord-seg--low-conf" : ""
                             }`}
                             style={{ width: `${w}%` }}
-                            title={`${c.label} ${formatTimeSec(c.start)}–${formatTimeSec(c.end)}`}
+                            title={`${transposeChordLabel(c.label, displayTransposeSemitones)} ${formatTimeSec(c.start)}–${formatTimeSec(c.end)}`}
                           >
-                            {c.label}
+                            {transposeChordLabel(c.label, displayTransposeSemitones)}
                           </div>
                         );
                       })}
@@ -2025,77 +3961,84 @@ export default function Home() {
               </div>
                   </section>
 
-                  <section className="analyze-advanced-chunk" aria-label="Every chord in order">
-                    <h4 className="analyze-advanced-h">Every chord in order</h4>
-                    <p className="analyze-more-p">
-                      Full timeline with start and end times — for fine placement, not a replacement for the main
-                      progression above.
-                    </p>
-                <div
-                  className="analyze-progression-scroll analyze-chord-rail analyze-chord-rail--detail"
-                  ref={progressionScrollRef}
-                >
-                  {chordRuns.map((run, runIdx) => {
-                    const isActive = runIdx === activeChordRunIndex;
-                    const isPast = activeChordRunIndex >= 0 && runIdx < activeChordRunIndex;
-                    const isNext = activeChordRunIndex >= 0 && runIdx === activeChordRunIndex + 1;
-                    const holdSec = Math.max(0, run.end - run.start);
-                    return (
-                      <button
-                        key={`run-${run.start}-${run.end}-${run.label}-${runIdx}`}
-                        type="button"
-                        data-prog-run={runIdx}
-                        className={`analyze-prog-chord${isActive ? " analyze-prog-chord--active" : ""}${
-                          isPast ? " analyze-prog-chord--past" : ""
-                        }${!isPast && !isActive ? " analyze-prog-chord--upcoming" : ""}`}
-                        onClick={() => {
-                          const el = analyzeAudioRef.current;
-                          if (!el) return;
-                          el.currentTime = run.start;
-                          setAnalyzePlaybackTime(run.start);
-                        }}
-                        title={`${run.label} at ${formatTimeSec(run.start)} (${holdSec.toFixed(0)}s)`}
+                  <details className="analyze-nested-drawer">
+                    <summary>Chord-by-chord timing</summary>
+                    <div className="analyze-nested-drawer-body">
+                      <p className="analyze-more-p analyze-more-p--nested">
+                        Exact timestamps for each symbol — for detail work. Most players stay with the main progression.
+                      </p>
+                      <div
+                        className="analyze-progression-scroll analyze-chord-rail analyze-chord-rail--detail"
+                        ref={progressionScrollRef}
                       >
-                        {isActive ? <span className="analyze-prog-badge">Now</span> : null}
-                        {isNext ? <span className="analyze-prog-badge analyze-prog-badge--next">Next</span> : null}
-                        <span className="analyze-prog-symbol">
-                          {run.label}
-                          {run.repeatCount > 1 ? (
-                            <span className="analyze-prog-repeat"> ×{run.repeatCount}</span>
-                          ) : null}
-                        </span>
-                        <span className="analyze-prog-time">
-                          {formatTimeSec(run.start)} – {formatTimeSec(run.end)}
-                        </span>
-                        <span className="analyze-prog-notes">{run.notesLine}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-                  </section>
+                        {chordRuns.map((run, runIdx) => {
+                          const isActive = runIdx === activeChordRunIndex;
+                          const isPast = activeChordRunIndex >= 0 && runIdx < activeChordRunIndex;
+                          const isNext = activeChordRunIndex >= 0 && runIdx === activeChordRunIndex + 1;
+                          const holdSec = Math.max(0, run.end - run.start);
+                          return (
+                            <button
+                              key={`run-${run.start}-${run.end}-${run.label}-${runIdx}`}
+                              type="button"
+                              data-prog-run={runIdx}
+                              className={`analyze-prog-chord${isActive ? " analyze-prog-chord--active" : ""}${
+                                isPast ? " analyze-prog-chord--past" : ""
+                              }${!isPast && !isActive ? " analyze-prog-chord--upcoming" : ""}`}
+                              onClick={() => {
+                                const el = analyzeAudioRef.current;
+                                if (!el) return;
+                                el.currentTime = run.start;
+                                setAnalyzePlaybackTime(run.start);
+                              }}
+                              title={`${transposeChordLabel(run.label, displayTransposeSemitones)} at ${formatTimeSec(run.start)} (${holdSec.toFixed(0)}s)`}
+                            >
+                              {isActive ? <span className="analyze-prog-badge">Now</span> : null}
+                              {isNext ? <span className="analyze-prog-badge analyze-prog-badge--next">Next</span> : null}
+                              <span className="analyze-prog-symbol">
+                                {transposeChordLabel(run.label, displayTransposeSemitones)}
+                                {run.repeatCount > 1 ? (
+                                  <span className="analyze-prog-repeat"> ×{run.repeatCount}</span>
+                                ) : null}
+                              </span>
+                              <span className="analyze-prog-time">
+                                {formatTimeSec(run.start)} – {formatTimeSec(run.end)}
+                              </span>
+                              <span className="analyze-prog-notes">
+                                {transposeChordToneLine(run.notesLine, displayTransposeSemitones)}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </details>
 
-                  <section className="analyze-advanced-chunk">
-                    <h4 className="analyze-advanced-h">Harmonic segments (from analysis)</h4>
-                <p className="analyze-more-p">
-                  Raw Section A / B-style cuts returned by the server. The main UI uses merged <strong>Part 1 / Part 2</strong>{" "}
-                  practice chunks above—open this only if you want to compare with the automatic segmentation.
-                </p>
-                <ul className="analyze-raw-sections-list">
-                  {(analyzeResult.sections ?? []).map((s, i) => (
-                    <li key={`raw-sec-${s.index ?? i}-${s.start}`}>
-                      {formatSectionDropdownLabel(s, analyzePlaybackDuration, i)}
-                    </li>
-                  ))}
-                </ul>
-                  </section>
-
-                  <section className="analyze-advanced-chunk">
-                    <h4 className="analyze-advanced-h">Meter / beats (estimate)</h4>
-                <p className="analyze-more-p">
-                  Approximate beat: {approxMeterReadout}. Uses {analyzeRhythmEffective.assumed_beats_per_bar} beats per
-                  bar (estimate only).
-                </p>
-                  </section>
+                  <details className="analyze-nested-drawer">
+                    <summary>Raw sections &amp; beat estimate</summary>
+                    <div className="analyze-nested-drawer-body">
+                      <section className="analyze-advanced-chunk analyze-advanced-chunk--nested-block" aria-label="Raw sections">
+                        <h4 className="analyze-advanced-h">Sections from the analyzer</h4>
+                        <p className="analyze-more-p">
+                          A/B-style markers from the server. Your practice <strong>Parts</strong> above are merged for easier
+                          looping.
+                        </p>
+                        <ul className="analyze-raw-sections-list">
+                          {(analyzeResult.sections ?? []).map((s, i) => (
+                            <li key={`raw-sec-${s.index ?? i}-${s.start}`}>
+                              {formatSectionDropdownLabel(s, analyzePlaybackDuration, i)}
+                            </li>
+                          ))}
+                        </ul>
+                      </section>
+                      <section className="analyze-advanced-chunk analyze-advanced-chunk--nested-block" aria-label="Meter estimate">
+                        <h4 className="analyze-advanced-h">Beat &amp; meter (estimate)</h4>
+                        <p className="analyze-more-p">
+                          Approximate place in the bar: {approxMeterReadout}. Assuming{" "}
+                          {analyzeRhythmEffective.assumed_beats_per_bar} beats per bar (hint only).
+                        </p>
+                      </section>
+                    </div>
+                  </details>
                 </div>
               </details>
             </>
@@ -2151,14 +4094,14 @@ export default function Home() {
           ) : null}
 
           {!analyzeResult && !analyzeLoading ? (
-            <p className="analyze-empty-hint">Choose an audio file, then run analysis to see chords and sections.</p>
+            <p className="analyze-empty-hint">Choose a file and tap Analyze to see chords, sections, and practice tools.</p>
           ) : null}
         </section>
       )}
 
       <p className="meta-footer">
-        API: <code>{API_BASE}</code> — set <code>NEXT_PUBLIC_API_URL</code> to override. Live diagnostics:{" "}
-        <code>?liveDebug=1</code> or <code>NEXT_PUBLIC_LIVE_MIC_DEBUG=1</code>.
+        API base: <code>{API_BASE}</code> — optional env <code>NEXT_PUBLIC_API_URL</code>. Optional verbose mic logs:{" "}
+        <code>?liveDebug=1</code>.
       </p>
     </main>
   );

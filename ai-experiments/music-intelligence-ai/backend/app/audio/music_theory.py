@@ -328,6 +328,70 @@ def pick_chord_with_theory(
 	return best_name, label, best_aud, second_audio, conf
 
 
+def chord_template_combined_candidates_debug(
+	chroma_hist: np.ndarray,
+	templates: Dict[str, np.ndarray],
+	*,
+	key_raw: str | None,
+	prev_internal: str | None,
+	normalize_vector,
+	top_k: int = 8,
+	key_bonus_max: float = 0.045,
+	prog_bonus_cap: float = 0.04,
+	continuity_bonus: float = CONTINUITY_WITH_PREV_BONUS,
+) -> List[dict]:
+	"""
+	Debug-only: mirror pick_chord_with_theory scoring without seventh collapse / N cutoff.
+	Returns top `top_k` entries by combined score with a short breakdown.
+	"""
+	from app.models.chords import _validate_chroma
+
+	chroma_vec = normalize_vector(_validate_chroma(chroma_hist))
+	out: List[dict] = []
+	if float(np.linalg.norm(chroma_vec)) < 1e-12:
+		return out
+
+	scored: List[Tuple[str, float]] = []
+	for name, template in templates.items():
+		if name == "N":
+			continue
+		tpl = normalize_vector(_validate_chroma(template))
+		scored.append((name, float(np.dot(chroma_vec, tpl))))
+	scored.sort(key=lambda x: x[1], reverse=True)
+	if not scored:
+		return out
+
+	second_audio_global = float(scored[1][1]) if len(scored) > 1 else 0.0
+	mel_pen = chroma_single_note_penalty(chroma_hist)
+	key_diats = diatonic_template_keys(key_raw)
+
+	combined_rows: List[Tuple[str, float, float, float, float, float, float]] = []
+	for name, aud in scored:
+		amargin = aud - second_audio_global
+		kb = key_fit_bonus(name, key_diats, audio_margin=amargin, audio_best=aud, max_bonus=key_bonus_max)
+		pb = min(prog_bonus_cap, progression_pair_bonus(prev_internal, name, key_raw))
+		cont = float(continuity_bonus) if (prev_internal and name == prev_internal) else 0.0
+		comb = aud + kb + pb - mel_pen + cont
+		combined_rows.append((name, comb, aud, kb, pb, mel_pen, cont))
+
+	combined_rows.sort(key=lambda x: x[1], reverse=True)
+	for row in combined_rows[:top_k]:
+		name, comb, aud, kb, pb, mel_pen_v, cont = row
+		out.append(
+			{
+				"internal": name,
+				"label": format_internal_chord_label(name),
+				"combined": round(float(comb), 6),
+				"audio_dot": round(float(aud), 6),
+				"key_bonus": round(float(kb), 6),
+				"prog_bonus": round(float(pb), 6),
+				"melody_penalty": round(float(mel_pen_v), 6),
+				"continuity_bonus": round(float(cont), 6),
+			},
+		)
+	return out
+
+
 def likely_passing_segment(
 	dur_sec: float,
 	label: str,

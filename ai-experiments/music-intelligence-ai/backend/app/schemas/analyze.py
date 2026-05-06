@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -52,6 +54,18 @@ class ChordSegment(BaseModel):
 	chord_role: str | None = Field(
 		None,
 		description="Optional role tag, e.g. 'passing' — beginner UI may ignore",
+	)
+	vocal_interference: bool = Field(
+		False,
+		description="Heuristic: chroma looked single-pitch heavy — treat chord change with caution",
+	)
+	exclude_from_core: bool = Field(
+		False,
+		description="When true, client may omit this segment from compact 'main progression' UI",
+	)
+	confidence_reasons: list[str] | None = Field(
+		None,
+		description="Optional short codes explaining weak confidence (debug / transparency)",
 	)
 
 
@@ -107,4 +121,8 @@ class AnalyzeResponse(BaseModel):
 	rhythm: RhythmHint = Field(
 		default_factory=RhythmHint,
 		description="Heuristic bar grouping from detected beats (not true meter detection)",
+	)
+	debug: dict[str, Any] | None = Field(
+		default=None,
+		description="Optional evaluation payload when debug=true was requested",
 	)

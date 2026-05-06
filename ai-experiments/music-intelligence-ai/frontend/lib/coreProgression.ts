@@ -17,6 +17,8 @@ export type ChordRunLike = {
   anyLowConfidence: boolean;
   /** When true, segment was tagged as likely passing harmony — omit from core progression when possible */
   isPassing?: boolean;
+  /** When true, omit from "main progression" heuristics (additive backend flag). */
+  excludeFromCore?: boolean;
 };
 
 const CORE_PROGRESSION_MAX_UNIQUE = 12;
@@ -82,8 +84,9 @@ function entryForLabel(runs: ChordRunLike[], label: string): CoreChordEntry {
  * fragments do not become "the loop" (timeline playback still uses full `chords`).
  */
 function runsForCoreProgression(runs: ChordRunLike[]): ChordRunLike[] {
-  const structural = runs.filter((r) => !r.isPassing);
-  const base = structural.length ? structural : runs;
+  const noCoreOptOut = runs.filter((r) => !r.excludeFromCore);
+  const structural = noCoreOptOut.filter((r) => !r.isPassing);
+  const base = structural.length ? structural : noCoreOptOut;
   const hi = base.filter((r) => r.label !== "N" && !r.anyLowConfidence);
   if (hi.length >= 2) {
     return hi;

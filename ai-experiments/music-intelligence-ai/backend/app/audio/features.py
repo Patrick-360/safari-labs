@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from typing import Tuple
+from typing import Any, List, Tuple
 
 import librosa
 import numpy as np
@@ -57,6 +57,48 @@ def waveform_rms(y: np.ndarray) -> float:
 	return float(np.sqrt(np.mean(np.square(array))))
 
 
+def waveform_peak_abs(y: np.ndarray) -> float:
+	"""Peak absolute sample (linear); pairs with RMS for crest / level gates."""
+	array = np.asarray(y, dtype=float).reshape(-1)
+	if array.size == 0:
+		return 0.0
+	return float(np.max(np.abs(array)))
+
+
+def chroma_hist_entropy_bits(chroma_hist: np.ndarray) -> float:
+	"""
+	Shannon entropy (natural log) of normalized non-negative chroma mass.
+	Uniform spread ≈ ln(12) ≈ 2.485; one sharp chord is lower (more peaked).
+	"""
+	v = np.maximum(np.asarray(chroma_hist, dtype=float).reshape(-1), 0.0)
+	s = float(np.sum(v))
+	if s < 1e-12:
+		return 0.0
+	p = v / s
+	return float(-np.sum(p * np.log(p + 1e-12)))
+
+
+def chroma_temporal_stability_mean_cos(chroma: np.ndarray) -> float:
+	"""Mean cosine similarity between adjacent chroma frames (12 x T). Higher = steadier / less transient."""
+	c = np.asarray(chroma, dtype=float)
+	if c.ndim != 2 or c.shape[0] != CHROMA_BINS:
+		raise ValueError("Chroma must have shape (12, T).")
+	if c.shape[1] < 2:
+		return 1.0
+	col_norm = np.linalg.norm(c, axis=0, keepdims=True) + EPS
+	n = c / col_norm
+	sims: list[float] = []
+	for i in range(n.shape[1] - 1):
+		sims.append(float(np.dot(n[:, i], n[:, i + 1])))
+	return float(np.mean(sims)) if sims else 1.0
+
+
+def count_strong_chroma_bins(chroma_hist: np.ndarray, threshold: float = 0.2) -> int:
+	"""Count L2-normalized chroma bins above threshold; single-speech-pitch often has ~1 strong bin."""
+	h = _normalize_vector(_validate_vector(chroma_hist, CHROMA_BINS))
+	return int(np.sum(h > threshold))
+
+
 def extract_chroma_cqt(y: np.ndarray, sr: int, use_hpss: bool = False) -> np.ndarray:
 	if y is None:
 		raise ValueError("Waveform is None.")
@@ -66,11 +108,17 @@ def extract_chroma_cqt(y: np.ndarray, sr: int, use_hpss: bool = False) -> np.nda
 	waveform = np.asarray(y, dtype=float)
 
 	if use_hpss:
-		# Larger harmonic margin → more harmonic energy kept, less percussive bleed into templates.
-		harmonic, _ = librosa.effects.hpss(waveform, margin=(2.2, 1.85))
+		# Wider harmonic margin (aligned with /analyze HPSS) → steadier triad chroma for live mic.
+		harmonic, _ = librosa.effects.hpss(waveform, margin=(2.75, 2.0))
 		waveform = harmonic
 
-	chroma = librosa.feature.chroma_cqt(y=waveform, sr=sr, hop_length=512)
+	chroma = librosa.feature.chroma_cqt(
+		y=waveform,
+		sr=sr,
+		hop_length=512,
+		norm=2,
+		threshold=0.025,
+	)
 	if chroma.shape[0] != CHROMA_BINS:
 		raise ValueError(f"Expected {CHROMA_BINS} chroma bins, got {chroma.shape[0]}.")
 	return chroma
@@ -125,6 +173,56 @@ def estimate_key(chroma_hist: np.ndarray) -> Tuple[str, float]:
 	confidence = max(0.0, min(1.0, margin / (abs(best_score) + EPS)))
 
 	return labels[best_index], confidence
+
+
+def key_ranked_candidates(chroma_hist: np.ndarray, top_k: int = 8) -> List[dict[str, Any]]:
+	"""
+	Debug-only: ranked Krumhansl key candidates (same dot scores as estimate_key).
+	Each entry: raw label, profile_dot, margin_to_next (among sorted candidates).
+	"""
+	hist = _normalize_vector(_validate_vector(chroma_hist, CHROMA_BINS))
+
+	major_profile = np.array(
+		[6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88],
+		dtype=float,
+	)
+	minor_profile = np.array(
+		[6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
+		dtype=float,
+	)
+
+	major_profile = _normalize_vector(major_profile)
+	minor_profile = _normalize_vector(minor_profile)
+
+	pitch_classes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+	scores: list[float] = []
+	labels: list[str] = []
+
+	for i, name in enumerate(pitch_classes):
+		scores.append(float(np.dot(hist, np.roll(major_profile, i))))
+		labels.append(f"{name}:maj")
+
+		scores.append(float(np.dot(hist, np.roll(minor_profile, i))))
+		labels.append(f"{name}:min")
+
+	pairs = sorted(zip(scores, labels, strict=True), key=lambda x: x[0], reverse=True)
+	k = max(1, min(int(top_k), len(pairs)))
+	out: List[dict[str, Any]] = []
+	for i in range(k):
+		s_i, lab = pairs[i]
+		s_next = pairs[i + 1][0] if i + 1 < len(pairs) else float("-inf")
+		margin = float(s_i - s_next) if np.isfinite(s_next) else float(s_i)
+		conf = max(0.0, min(1.0, margin / (abs(float(s_i)) + EPS)))
+		out.append(
+			{
+				"raw": lab,
+				"profile_dot": round(float(s_i), 6),
+				"margin_to_next": round(float(margin), 6),
+				"margin_confidence": round(float(conf), 4),
+			},
+		)
+	return out
 
 
 def score_key_profile_fit(chroma_hist: np.ndarray, key_label_raw: str) -> float:
