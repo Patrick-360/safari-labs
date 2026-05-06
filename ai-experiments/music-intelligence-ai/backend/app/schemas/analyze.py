@@ -1,0 +1,110 @@
+"""Typed JSON contract for POST /analyze."""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class KeyInfo(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+	label: str = Field(..., description="Global key, e.g. 'C major'")
+	confidence: float = Field(0.0, ge=0.0, le=1.0, description="Key estimate confidence")
+
+
+class ChordSegment(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+	start: float = Field(..., description="Start time in seconds")
+	end: float = Field(..., description="End time in seconds")
+	label: str = Field(..., description="Chord symbol, e.g. 'Am', 'C'")
+	notes: list[str] = Field(
+		default_factory=list,
+		description="Heuristic close-position triad spellings (not voicing/inversion)",
+	)
+	practice_hint: str = Field(
+		"",
+		description="Short practice sentence; simplified theory—not exact transcription",
+	)
+	confidence: float = Field(
+		0.5,
+		ge=0.0,
+		le=1.0,
+		description="Relative certainty from template separation (marginal)",
+	)
+	low_confidence: bool = Field(
+		False,
+		description="True when estimate is weak — interpret label with caution",
+	)
+	# Optional debugging / review fields (additive; safe for older clients to ignore).
+	template_score: float | None = Field(
+		None,
+		description="Best cosine similarity vs chord templates at segment chroma (0–1 scale)",
+	)
+	template_margin: float | None = Field(
+		None,
+		description="Raw separation best_score − second_score before UI confidence shaping",
+	)
+	is_passing: bool = Field(
+		False,
+		description="Heuristic: very short sandwich segment between two equal stable chords — likely passing harmony",
+	)
+	chord_role: str | None = Field(
+		None,
+		description="Optional role tag, e.g. 'passing' — beginner UI may ignore",
+	)
+
+
+class BeatTime(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+	time: float = Field(..., ge=0.0, description="Beat time in seconds from start of track")
+
+
+class SectionSpan(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+	index: int = Field(..., ge=0, description="0-based section order in the track")
+	start: float = Field(..., ge=0.0, description="Section start in seconds")
+	end: float = Field(..., description="Section end in seconds")
+	label: str = Field(..., description="Section label, e.g. 'Section A' when repeats are merged")
+	repeat_group: str | None = Field(
+		None,
+		description="Letter shared by musically similar blocks (heuristic repetition)",
+	)
+
+
+class RhythmHint(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+	assumed_beats_per_bar: int = Field(
+		4,
+		ge=1,
+		le=12,
+		description="Heuristic beats per measure for grouping (default 4/4 assumption)",
+	)
+	bar_start_times: list[float] = Field(
+		default_factory=list,
+		description="Times (s) of assumed downbeats: every Nth beat from beat_track",
+	)
+
+
+class AnalyzeResponse(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+	duration: float = Field(..., description="Audio duration in seconds")
+	tempo: float = Field(..., description="Estimated tempo in BPM")
+	key: KeyInfo
+	chords: list[ChordSegment] = Field(default_factory=list)
+	beats: list[BeatTime] = Field(
+		default_factory=list,
+		description="Detected beat onsets (librosa beat_track), seconds",
+	)
+	sections: list[SectionSpan] = Field(
+		default_factory=list,
+		description="Coarse sections from chroma similarity over beat- or time-aligned windows",
+	)
+	rhythm: RhythmHint = Field(
+		default_factory=RhythmHint,
+		description="Heuristic bar grouping from detected beats (not true meter detection)",
+	)

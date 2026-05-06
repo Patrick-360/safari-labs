@@ -11,6 +11,10 @@ import soundfile as sf
 CHROMA_BINS = 12
 EPS = 1e-8
 
+# Mono float waveform ~[-1, 1] after decode/resample; RMS below this → silence gate (stream chord path).
+# Slightly conservative: short mic chunks can sit below 1e-3 at normal speaking/music distance.
+SILENCE_RMS_THRESHOLD = 4e-4
+
 
 def _validate_vector(vector: np.ndarray, size: int) -> np.ndarray:
 	if vector is None:
@@ -45,6 +49,14 @@ def load_audio_bytes_wav(audio_bytes: bytes, sr: int = 22050) -> Tuple[np.ndarra
 	return y.astype(np.float32, copy=False), native_sr
 
 
+def waveform_rms(y: np.ndarray) -> float:
+	"""Root mean square of a 1-D float waveform (linear scale)."""
+	array = np.asarray(y, dtype=float).reshape(-1)
+	if array.size == 0:
+		return 0.0
+	return float(np.sqrt(np.mean(np.square(array))))
+
+
 def extract_chroma_cqt(y: np.ndarray, sr: int, use_hpss: bool = False) -> np.ndarray:
 	if y is None:
 		raise ValueError("Waveform is None.")
@@ -54,10 +66,11 @@ def extract_chroma_cqt(y: np.ndarray, sr: int, use_hpss: bool = False) -> np.nda
 	waveform = np.asarray(y, dtype=float)
 
 	if use_hpss:
-		harmonic, _ = librosa.effects.hpss(waveform)
+		# Larger harmonic margin → more harmonic energy kept, less percussive bleed into templates.
+		harmonic, _ = librosa.effects.hpss(waveform, margin=(2.2, 1.85))
 		waveform = harmonic
 
-	chroma = librosa.feature.chroma_cqt(y=waveform, sr=sr)
+	chroma = librosa.feature.chroma_cqt(y=waveform, sr=sr, hop_length=512)
 	if chroma.shape[0] != CHROMA_BINS:
 		raise ValueError(f"Expected {CHROMA_BINS} chroma bins, got {chroma.shape[0]}.")
 	return chroma
@@ -112,3 +125,33 @@ def estimate_key(chroma_hist: np.ndarray) -> Tuple[str, float]:
 	confidence = max(0.0, min(1.0, margin / (abs(best_score) + EPS)))
 
 	return labels[best_index], confidence
+
+
+def score_key_profile_fit(chroma_hist: np.ndarray, key_label_raw: str) -> float:
+	"""
+	Dot product of normalized chroma with the Krumhansl profile for a single key,
+	e.g. key_label_raw == 'C:maj' or 'A:min'. Same profiles as estimate_key.
+	"""
+	hist = _normalize_vector(_validate_vector(chroma_hist, CHROMA_BINS))
+
+	major_profile = np.array(
+		[6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88],
+		dtype=float,
+	)
+	minor_profile = np.array(
+		[6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
+		dtype=float,
+	)
+
+	major_profile = _normalize_vector(major_profile)
+	minor_profile = _normalize_vector(minor_profile)
+
+	pitch_classes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+	for i, name in enumerate(pitch_classes):
+		if key_label_raw == f"{name}:maj":
+			return float(np.dot(hist, np.roll(major_profile, i)))
+		if key_label_raw == f"{name}:min":
+			return float(np.dot(hist, np.roll(minor_profile, i)))
+
+	raise ValueError(f"Unknown key label: {key_label_raw!r}")

@@ -6,6 +6,9 @@ import numpy as np
 
 
 CHROMA_BINS = 12
+# Seventh partial is slightly down-weighted in templates so a lone melodic seventh
+# does not routinely beat the triad on noisy / vocal-heavy HPSS chroma (heuristic, not robust separation).
+SEVENTH_BIN_WEIGHT = 0.72
 
 
 def _normalize_vector(vector: np.ndarray) -> np.ndarray:
@@ -25,9 +28,22 @@ def _validate_chroma(vector: np.ndarray) -> np.ndarray:
 	return array
 
 
-def build_chord_templates() -> Dict[str, np.ndarray]:
+def build_chord_templates(
+	*,
+	include_sevenths: bool = False,
+	include_extended: bool = False,
+) -> Dict[str, np.ndarray]:
+	"""
+	Chord prototypes as sparse chroma vectors (not a full chord-recognition model).
+
+	include_sevenths: dom7 / maj7 / min7 (+ /analyze).
+	include_extended: dim, aug, sus2, sus4, half-diminished m7b5 (+ /analyze when True).
+	Live /stream uses defaults (triads only) so behavior stays predictable.
+	"""
 	templates: Dict[str, np.ndarray] = {}
 	pitch_classes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+	w7 = float(SEVENTH_BIN_WEIGHT)
+	w_part = 0.88
 
 	for root_index, root_name in enumerate(pitch_classes):
 		major = np.zeros(CHROMA_BINS, dtype=float)
@@ -43,6 +59,42 @@ def build_chord_templates() -> Dict[str, np.ndarray]:
 
 		templates[f"{root_name}:maj"] = major
 		templates[f"{root_name}:min"] = minor
+
+		if include_extended:
+			dim = np.zeros(CHROMA_BINS, dtype=float)
+			for interval in (0, 3, 6):
+				dim[(root_index + interval) % CHROMA_BINS] = 1.0
+			aug = np.zeros(CHROMA_BINS, dtype=float)
+			for interval in (0, 4, 8):
+				aug[(root_index + interval) % CHROMA_BINS] = 1.0
+			sus2 = np.zeros(CHROMA_BINS, dtype=float)
+			for interval in (0, 2, 7):
+				sus2[(root_index + interval) % CHROMA_BINS] = 1.0
+			sus4 = np.zeros(CHROMA_BINS, dtype=float)
+			for interval in (0, 5, 7):
+				sus4[(root_index + interval) % CHROMA_BINS] = 1.0
+			m7b5 = np.zeros(CHROMA_BINS, dtype=float)
+			for interval, weight in ((0, 1.0), (3, 1.0), (6, w_part), (10, w7)):
+				m7b5[(root_index + interval) % CHROMA_BINS] = weight
+			templates[f"{root_name}:dim"] = dim
+			templates[f"{root_name}:aug"] = aug
+			templates[f"{root_name}:sus2"] = sus2
+			templates[f"{root_name}:sus4"] = sus4
+			templates[f"{root_name}:m7b5"] = m7b5
+
+		if include_sevenths:
+			dom7 = np.zeros(CHROMA_BINS, dtype=float)
+			maj7 = np.zeros(CHROMA_BINS, dtype=float)
+			min7 = np.zeros(CHROMA_BINS, dtype=float)
+			for interval, weight in ((0, 1.0), (4, 1.0), (7, 1.0), (10, w7)):
+				dom7[(root_index + interval) % CHROMA_BINS] = weight
+			for interval, weight in ((0, 1.0), (4, 1.0), (7, 1.0), (11, w7)):
+				maj7[(root_index + interval) % CHROMA_BINS] = weight
+			for interval, weight in ((0, 1.0), (3, 1.0), (7, 1.0), (10, w7)):
+				min7[(root_index + interval) % CHROMA_BINS] = weight
+			templates[f"{root_name}:7"] = dom7
+			templates[f"{root_name}:maj7"] = maj7
+			templates[f"{root_name}:min7"] = min7
 
 	templates["N"] = np.zeros(CHROMA_BINS, dtype=float)
 	return templates
