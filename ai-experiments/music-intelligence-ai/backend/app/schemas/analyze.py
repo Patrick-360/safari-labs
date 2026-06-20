@@ -119,6 +119,10 @@ class AnalyzeResponse(BaseModel):
 	duration: float = Field(..., description="Audio duration in seconds")
 	tempo: float = Field(..., description="Estimated tempo in BPM")
 	key: KeyInfo
+	chord_engine: str = Field(
+		default="theory",
+		description="Chord analysis preset used for this response: stable | theory | experimental",
+	)
 	chords: list[ChordSegment] = Field(default_factory=list)
 	beats: list[BeatTime] = Field(
 		default_factory=list,

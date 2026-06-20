@@ -10,6 +10,12 @@ export type CoreChordEntry = {
   anyLowConfidence: boolean;
 };
 
+export type CoreProgressionResult = {
+  entries: CoreChordEntry[];
+  fallbackUsed: boolean;
+  fallbackReason: string | null;
+};
+
 /** Mirror ChordRun from page — avoid importing React page here. */
 export type ChordRunLike = {
   label: string;
@@ -28,6 +34,10 @@ const REPEAT_MAX_PATTERN_LEN = 8;
 
 function runsWithoutN(runs: ChordRunLike[]): ChordRunLike[] {
   return runs.filter((r) => r.label !== "N");
+}
+
+function uniqueLabelCount(runs: ChordRunLike[]): number {
+  return new Set(runs.filter((r) => r.label !== "N").map((r) => r.label)).size;
 }
 
 /**
@@ -79,11 +89,28 @@ function entryForLabel(runs: ChordRunLike[], label: string): CoreChordEntry {
   };
 }
 
+function buildEntriesFromRuns(work: ChordRunLike[]): CoreChordEntry[] {
+  if (!work.length) {
+    return [];
+  }
+  const labels = work.map((r) => r.label);
+  const periodLen = findSmallestRepeatingPatternLength(labels);
+  if (periodLen !== null) {
+    return work.slice(0, periodLen).map((r) => ({
+      label: r.label,
+      notesLine: r.notesLine,
+      anyLowConfidence: r.anyLowConfidence,
+    }));
+  }
+  const uniqueLabels = uniqueInOrder(labels);
+  const capped = uniqueLabels.slice(0, CORE_PROGRESSION_MAX_UNIQUE);
+  return capped.map((lab) => entryForLabel(work, lab));
+}
+
 /**
- * Prefer high-confidence runs when building the main progression so brief / uncertain
- * fragments do not become "the loop" (timeline playback still uses full `chords`).
+ * Strict filter: prefer high-confidence, non-passing runs not flagged excludeFromCore.
  */
-function runsForCoreProgression(runs: ChordRunLike[]): ChordRunLike[] {
+function runsStrictCore(runs: ChordRunLike[]): ChordRunLike[] {
   const noCoreOptOut = runs.filter((r) => !r.excludeFromCore);
   const structural = noCoreOptOut.filter((r) => !r.isPassing);
   const base = structural.length ? structural : noCoreOptOut;
@@ -95,27 +122,75 @@ function runsForCoreProgression(runs: ChordRunLike[]): ChordRunLike[] {
 }
 
 /**
- * Build core progression from consecutive chord runs (already merged identical neighbors).
+ * Medium filter: ignore excludeFromCore; drop passing only.
  */
-export function deriveCoreProgression(runs: ChordRunLike[]): CoreChordEntry[] {
-  const work = runsForCoreProgression(runs);
-  if (!work.length) {
-    return [];
-  }
-  const labels = work.map((r) => r.label);
+function runsMediumCore(runs: ChordRunLike[]): ChordRunLike[] {
+  return runsWithoutN(runs.filter((r) => !r.isPassing));
+}
 
-  const periodLen = findSmallestRepeatingPatternLength(labels);
-  if (periodLen !== null) {
-    return work.slice(0, periodLen).map((r) => ({
-      label: r.label,
-      notesLine: r.notesLine,
-      anyLowConfidence: r.anyLowConfidence,
-    }));
+/**
+ * First distinct label changes in timeline order (readable fallback).
+ */
+function runsFirstRawChanges(runs: ChordRunLike[], max = 8): ChordRunLike[] {
+  const noN = runsWithoutN(runs);
+  const out: ChordRunLike[] = [];
+  let last = "";
+  for (const r of noN) {
+    if (r.label !== last) {
+      out.push(r);
+      last = r.label;
+    }
+    if (out.length >= max) {
+      break;
+    }
+  }
+  return out.length ? out : noN.slice(0, Math.min(4, noN.length));
+}
+
+type SelectedRuns = { runs: ChordRunLike[]; fallbackReason: string | null };
+
+/**
+ * Pick runs for core progression with tiered fallback so filtering never collapses
+ * a normal song to one chord when the raw timeline has more harmony.
+ */
+function selectRunsForCoreProgression(runs: ChordRunLike[]): SelectedRuns {
+  const noN = runsWithoutN(runs);
+  if (!noN.length) {
+    return { runs: [], fallbackReason: "empty_timeline" };
   }
 
-  const uniqueLabels = uniqueInOrder(labels);
-  const capped = uniqueLabels.slice(0, CORE_PROGRESSION_MAX_UNIQUE);
-  return capped.map((lab) => entryForLabel(work, lab));
+  const strict = runsStrictCore(runs);
+  if (uniqueLabelCount(strict) >= 2 && strict.length >= 2) {
+    return { runs: strict, fallbackReason: null };
+  }
+
+  const medium = runsMediumCore(runs);
+  if (uniqueLabelCount(medium) >= 2 && medium.length >= 2) {
+    return { runs: medium, fallbackReason: "fallback_medium_non_passing" };
+  }
+
+  if (uniqueLabelCount(noN) >= 2 && noN.length >= 2) {
+    return { runs: noN, fallbackReason: "fallback_all_non_n" };
+  }
+
+  if (noN.length >= 4) {
+    return { runs: runsFirstRawChanges(runs), fallbackReason: "fallback_first_raw_changes" };
+  }
+
+  return { runs: noN, fallbackReason: "fallback_sparse_timeline" };
+}
+
+/**
+ * Build core progression from consecutive chord runs (already merged identical neighbors).
+ * Timeline playback still uses full `chords` — this is the cleaned summary only.
+ */
+export function deriveCoreProgression(runs: ChordRunLike[]): CoreProgressionResult {
+  const { runs: work, fallbackReason } = selectRunsForCoreProgression(runs);
+  return {
+    entries: buildEntriesFromRuns(work),
+    fallbackUsed: fallbackReason !== null,
+    fallbackReason,
+  };
 }
 
 export function firstChordTimeForLabel(

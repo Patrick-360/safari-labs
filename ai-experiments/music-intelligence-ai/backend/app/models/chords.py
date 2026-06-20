@@ -122,6 +122,16 @@ def build_analyze_heuristic_templates() -> Dict[str, np.ndarray]:
 	return {k: v for k, v in full.items() if k == "N" or not str(k).endswith(":m7b5")}
 
 
+def build_analyze_theory_templates() -> Dict[str, np.ndarray]:
+	"""
+	Theory-enhanced /analyze set: maj/min + guarded dom7 / maj7 / min7 + dim / aug / sus + N.
+
+	Sevenths use stricter scoring gates than triads; m7b5 stays out (too easy to mislabel).
+	"""
+	full = build_chord_templates(include_sevenths=True, include_extended=True)
+	return {k: v for k, v in full.items() if k == "N" or not str(k).endswith(":m7b5")}
+
+
 def chord_score(chroma: np.ndarray, template: np.ndarray) -> float:
 	chroma_vec = _normalize_vector(_validate_chroma(chroma))
 	template_vec = _normalize_vector(_validate_chroma(template))

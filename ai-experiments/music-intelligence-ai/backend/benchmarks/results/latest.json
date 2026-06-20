@@ -1,0 +1,80 @@
+{
+  "generated_at": "2026-06-20T12:03:56.210996+00:00",
+  "bin_sec": 0.05,
+  "engines": [
+    "theory"
+  ],
+  "clip_count": 1,
+  "clips": [
+    {
+      "title": "Synthetic C\u2013G\u2013Am\u2013F",
+      "audio_file": "synthetic_c_g_am_f.wav",
+      "annotation_file": "synthetic_c_g_am_f.json",
+      "ground_truth": {
+        "key": "C major",
+        "chord_segment_count": 4,
+        "chords": [
+          {
+            "start": 0.0,
+            "end": 1.1,
+            "label": "C"
+          },
+          {
+            "start": 1.1,
+            "end": 2.2,
+            "label": "G"
+          },
+          {
+            "start": 2.2,
+            "end": 3.3000000000000003,
+            "label": "Am"
+          },
+          {
+            "start": 3.3,
+            "end": 4.4,
+            "label": "F"
+          }
+        ]
+      },
+      "engines": {
+        "theory": {
+          "key_predicted": "C major",
+          "key_match": true,
+          "accuracy_weighted_pct": 98.86,
+          "accuracy_unweighted_pct": 98.86,
+          "annotated_seconds": 4.4,
+          "matched_seconds": 4.35,
+          "mean_start_error_sec": 0.016,
+          "mean_end_error_sec": 0.016,
+          "boundary_pairs": 4,
+          "segment_count_predicted": 4,
+          "confusion_seconds": {
+            "C": {
+              "C": 1.1
+            },
+            "G": {
+              "G": 1.1
+            },
+            "F": {
+              "F": 1.1
+            },
+            "Am": {
+              "Am": 1.05,
+              "G": 0.05
+            }
+          }
+        }
+      }
+    }
+  ],
+  "summary_by_engine": {
+    "theory": {
+      "clips": 1,
+      "mean_accuracy_weighted_pct": 98.86,
+      "mean_accuracy_unweighted_pct": 98.86,
+      "key_match_rate_pct": 100.0,
+      "mean_start_error_sec": 0.016,
+      "mean_end_error_sec": 0.016
+    }
+  }
+}

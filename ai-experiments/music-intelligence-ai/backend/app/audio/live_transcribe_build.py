@@ -11,6 +11,51 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+from app.audio.live_thresholds import LIVE_ROUTE_LIVE_TRANSCRIPTION, SEMANTIC_LIVE_TRANSCRIPTION
+
+
+def _qualifying_live_segments(
+	chords_raw: List[Dict[str, Any]],
+	*,
+	conf_floor: float,
+) -> tuple[int, float]:
+	"""Chunks that look like tonal evidence (templates were confident enough on /analyze heuristic path)."""
+
+	n_ok = 0
+	sec_ok = 0.0
+	for c in chords_raw:
+		lab = str(c.get("label", "N")).strip()
+		if lab in ("", "N", "n"):
+			continue
+		if bool(c.get("low_confidence", False)):
+			continue
+		if float(c.get("confidence", 0.0)) + 1e-9 < conf_floor:
+			continue
+		n_ok += 1
+		sec_ok += float(c["end"]) - float(c["start"])
+	return n_ok, sec_ok
+
+
+def _live_progression_publishable(entries: List[Dict[str, Any]], chords_raw: List[Dict[str, Any]]) -> tuple[bool, str | None]:
+	"""
+	Block single-noise-chip “progressions”: need ≥2 harmonic symbols unless many confident segments/time back one label.
+	Raises empty_reason codes consumed by masked UI summaries.
+	"""
+	if len(entries) < 1:
+		return False, None
+	if len(entries) >= 2:
+		return True, None
+	conf_floor = 0.24
+	ok_n, ok_sec = _qualifying_live_segments(chords_raw, conf_floor=conf_floor)
+	# Sustain / drone: plenty of tonal time but only one harmonic label printed.
+	if ok_sec >= 4.9:
+		return True, None
+	if ok_n >= 4 and ok_sec >= 3.2:
+		return True, None
+	if ok_n < 2:
+		return False, "not_enough_harmonic_segment_count"
+	return False, "need_second_progression_symbol"
+
 
 def _runs_from_segments(chords: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 	"""Merge adjacent same-label segments → chord runs with merged flags."""
@@ -164,21 +209,33 @@ def _choose_progression_and_meta(
 
 	core_stable = _core_entries_from_work(work, max_unique=10)
 	if core_stable:
-		meta["source"] = "stable_core"
-		if "use_high_confidence_runs_len_ge_2" in work_strategy:
-			meta["quality"] = "likely"
-		elif len(core_stable) >= 4:
-			meta["quality"] = "stabilizing"
-		else:
-			meta["quality"] = "rough"
-		return core_stable, meta
+		pub_ok, er = _live_progression_publishable(core_stable, chords_raw)
+		if pub_ok:
+			meta["source"] = "stable_core"
+			if "use_high_confidence_runs_len_ge_2" in work_strategy:
+				meta["quality"] = "likely"
+			elif len(core_stable) >= 4:
+				meta["quality"] = "stabilizing"
+			else:
+				meta["quality"] = "rough"
+			return core_stable, meta
+		meta["source"] = "none"
+		meta["quality"] = "still_listening"
+		meta["empty_reason"] = er or "still_listening"
+		return [], meta
 
 	fallback = _fallback_core_from_raw_chords(chords_raw, max_unique=8)
 	if fallback:
-		meta["source"] = "fallback_time_order"
-		meta["quality"] = "rough"
-		meta["empty_reason"] = None
-		return fallback, meta
+		pub_ok, er = _live_progression_publishable(fallback, chords_raw)
+		if pub_ok:
+			meta["source"] = "fallback_time_order"
+			meta["quality"] = "rough"
+			meta["empty_reason"] = None
+			return fallback, meta
+		meta["source"] = "none"
+		meta["quality"] = "still_listening"
+		meta["empty_reason"] = er or "still_listening"
+		return [], meta
 
 	total, non_n, low_nn = _raw_chord_stats(chords_raw)
 	if total == 0:
@@ -218,6 +275,11 @@ def _build_live_transcribe_debug(
 	core: List[Dict[str, Any]],
 	merged_timeline_seg_count: int | None,
 	progression_meta: Dict[str, Any],
+	preflight_snapshot: Dict[str, Any] | None = None,
+	listen_masked: bool = False,
+	confident_live_segment_approx: int = 0,
+	confident_live_duration_sec_approx: float = 0.0,
+	live_transcription_preset_id: str | None = None,
 ) -> Dict[str, Any]:
 	ad = analysis.get("debug") if isinstance(analysis.get("debug"), dict) else {}
 	key_obj = analysis.get("key") or {}
@@ -230,10 +292,16 @@ def _build_live_transcribe_debug(
 	dbg_empty = progression_meta.get("empty_reason")
 	core_dbg = _explain_core_empty(runs, work, core)
 	dbg: Dict[str, Any] = {
-		"version": 1,
+		"version": 2,
 		"window_duration_sec": round(float(window_duration_sec), 4),
 		"window_start": round(float(window_start), 4),
 		"window_end": round(float(window_start + window_duration_sec), 4),
+		"live_transcription_preset_id": live_transcription_preset_id,
+		"live_preset_semantic": SEMANTIC_LIVE_TRANSCRIPTION,
+		"preflight_metrics": dict(preflight_snapshot) if isinstance(preflight_snapshot, dict) else {},
+		"harmonic_listen_masked": bool(listen_masked),
+		"confident_live_segment_approx": confident_live_segment_approx,
+		"confident_live_duration_sec_approx": confident_live_duration_sec_approx,
 		"segment_count": total_seg,
 		"stable_segment_count": stable,
 		"low_confidence_segment_count": low_c,
@@ -306,6 +374,119 @@ def build_summary(key_label: str, key_conf: float, core: List[Dict[str, Any]], t
 	)
 
 
+_SUMMARY_HINTS_LISTEN_ONLY: Dict[str, str] = {
+	"waiting_for_more_audio": "Need a slightly longer buffered slice.",
+	"input_too_quiet": "Input is quiet — move closer, raise volume, or increase input boost.",
+	"not_enough_harmonic_signal": "Not enough steady harmonic tone in this slice (noise / speech / silence).",
+	"not_enough_confident_chord_time": "Heard tonal hints but chord evidence is too thin for a progression sketch.",
+	"need_second_progression_symbol": "Still listening for a stable progression…",
+	"not_enough_harmonic_segment_count": "Still listening for a stable progression…",
+}
+
+
+def build_live_listen_only_payload(
+	window_start: float,
+	window_end: float,
+	*,
+	session_id: str | None,
+	reason_code: str,
+	summary_hint: str | None = None,
+	include_debug: bool = False,
+	preflight_metrics: Dict[str, Any] | None = None,
+	progression_was_updated: bool = False,
+	core_empty_explanation: str | None = None,
+) -> Dict[str, Any]:
+	"""Response when skipping or discarding harmonic output (live mic safety)."""
+
+	summary_text = (
+		summary_hint
+		if summary_hint is not None
+		else _SUMMARY_HINTS_LISTEN_ONLY.get(
+			str(reason_code),
+			"Still listening for a stable progression…",
+		)
+	)
+	out_dict: Dict[str, Any] = {
+		"window_start": round(float(window_start), 4),
+		"window_end": round(float(window_end), 4),
+		"session_id": session_id,
+		"key": {"label": "—", "confidence": 0.0},
+		"current_chord": "—",
+		"chords": [],
+		"core_progression": [],
+		"progression_meta": {
+			"source": "none",
+			"quality": "still_listening",
+			"empty_reason": str(reason_code) if reason_code else None,
+		},
+		"summary": summary_text,
+		"status": "listening",
+		"tempo_bpm": 0.0,
+	}
+	if include_debug:
+		out_dict["debug"] = {
+			"version": 2,
+			"live_preset_semantic": SEMANTIC_LIVE_TRANSCRIPTION,
+			"live_route": LIVE_ROUTE_LIVE_TRANSCRIPTION,
+			"listen_only": True,
+			"listening_reason": reason_code,
+			"rejection_reason": str(reason_code) if reason_code else "",
+			"key_updated_this_window": False,
+			"progression_updated_this_window": bool(progression_was_updated),
+			"why_progression_empty": core_empty_explanation or reason_code,
+			"preflight_metrics": preflight_metrics,
+			"final_current_chord": "—",
+		}
+	return out_dict
+
+
+def suppress_noisy_live_analysis(analysis: Dict[str, Any]) -> Tuple[bool, str]:
+	"""
+	Post-hoc suppression when `run_analysis` returns labels but tonal evidence spans too little time
+	(typical noisy/silent mic captures after template loosening).
+	"""
+	duration = float(analysis.get("duration", 0.0))
+	conf_floor = 0.247
+	chords_raw: List[Dict[str, Any]] = list(analysis.get("chords") or [])
+	evidence_sec = 0.0
+	confident_segments = 0
+	for c in chords_raw:
+		lab = str(c.get("label", "N")).strip()
+		if lab in ("N", "", "n"):
+			continue
+		if bool(c.get("low_confidence", False)):
+			continue
+		conf = float(c.get("confidence", 0.0))
+		if conf < conf_floor:
+			continue
+		confident_segments += 1
+		evidence_sec += float(c["end"]) - float(c["start"])
+
+	if confident_segments <= 0:
+		return True, "not_enough_harmonic_signal"
+	if confident_segments < 2:
+		return True, "not_enough_harmonic_signal"
+	if duration + 1e-9 >= 14.5 and evidence_sec < 5.9:
+		return True, "not_enough_confident_chord_time"
+	if duration >= 9.25 and evidence_sec < 4.95:
+		return True, "not_enough_confident_chord_time"
+	if duration <= 9.24 and duration >= 7.05 and evidence_sec < 3.75:
+		return True, "not_enough_confident_chord_time"
+	if duration <= 7.05 and evidence_sec < 2.2:
+		return True, "not_enough_confident_chord_time"
+	return False, ""
+
+
+def _apply_live_listen_mask(out: Dict[str, Any], *, empty_reason: str | None) -> None:
+	rc = str(empty_reason or "")
+	out["key"] = {"label": "—", "confidence": 0.0}
+	out["current_chord"] = "—"
+	out["chords"] = []
+	out["core_progression"] = []
+	out["tempo_bpm"] = 0.0
+	out["summary"] = _SUMMARY_HINTS_LISTEN_ONLY.get(rc, "Still listening for a stable progression…")
+
+
 def build_live_transcribe_from_analysis(
 	analysis: Dict[str, Any],
 	*,
@@ -313,6 +494,8 @@ def build_live_transcribe_from_analysis(
 	session_id: str | None,
 	include_debug: bool = False,
 	merged_timeline_seg_count: int | None = None,
+	preflight_metrics: Dict[str, Any] | None = None,
+	live_transcription_preset_id: str | None = None,
 ) -> Dict[str, Any]:
 	"""Shape `run_analysis` output into /live-transcribe contract."""
 	duration = float(analysis.get("duration", 0.0))
@@ -325,6 +508,7 @@ def build_live_transcribe_from_analysis(
 	runs = _runs_from_segments(chords_raw)
 	work, work_strategy = _runs_for_core_progression(runs)
 	core, progression_meta = _choose_progression_and_meta(chords_raw, runs, work, work_strategy)
+	qual_n, qual_sec = _qualifying_live_segments(chords_raw, conf_floor=0.24)
 
 	current = _current_chord_at_end(chords_raw, duration)
 	if current == "—" and core:
@@ -333,9 +517,9 @@ def build_live_transcribe_from_analysis(
 	tempo = float(analysis.get("tempo", 0.0))
 	summary = build_summary(key_label, key_conf, core, tempo)
 
-	status = "ready"
-	if progression_meta.get("source") == "none" and progression_meta.get("empty_reason"):
-		status = "listening"
+	core_nonempty = len(core) > 0
+	status = "ready" if core_nonempty else "listening"
+	listen_masked = not core_nonempty
 
 	out: Dict[str, Any] = {
 		"window_start": round(float(window_start), 4),
@@ -354,7 +538,10 @@ def build_live_transcribe_from_analysis(
 		"status": status,
 		"tempo_bpm": round(tempo, 2),
 	}
+	if listen_masked:
+		_apply_live_listen_mask(out, empty_reason=str(progression_meta.get("empty_reason") or ""))
 	if include_debug:
+		dbg_pf = dict(preflight_metrics or {})
 		out["debug"] = _build_live_transcribe_debug(
 			analysis,
 			window_start=window_start,
@@ -366,5 +553,22 @@ def build_live_transcribe_from_analysis(
 			core=core,
 			merged_timeline_seg_count=merged_timeline_seg_count,
 			progression_meta=progression_meta,
+			preflight_snapshot=dbg_pf,
+			listen_masked=listen_masked,
+			confident_live_segment_approx=qual_n,
+			confident_live_duration_sec_approx=round(qual_sec, 4),
+			live_transcription_preset_id=live_transcription_preset_id,
 		)
+		pg_empty = progression_meta.get("empty_reason")
+		explain = pg_empty if not core_nonempty else None
+		if not explain and status == "listening":
+			explain = "core_progression_empty_or_filtered"
+		out["debug"]["live_route_active"] = LIVE_ROUTE_LIVE_TRANSCRIPTION
+		out["debug"]["live_preset_semantic"] = SEMANTIC_LIVE_TRANSCRIPTION
+		out["debug"]["final_current_chord"] = str(out["current_chord"])
+		out["debug"]["listen_only"] = bool(listen_masked)
+		out["debug"]["key_updated_this_window"] = bool(not listen_masked)
+		out["debug"]["progression_updated_this_window"] = bool(core_nonempty and not listen_masked)
+		out["debug"]["harmonic_listen_masked"] = bool(listen_masked)
+		out["debug"]["why_progression_empty"] = explain
 	return out

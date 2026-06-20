@@ -1,0 +1,27 @@
+{
+  "title": "Synthetic C\u2013G\u2013Am\u2013F",
+  "audio_file": "synthetic_c_g_am_f.wav",
+  "key": "C major",
+  "chords": [
+    {
+      "start": 0.0,
+      "end": 1.1,
+      "label": "C"
+    },
+    {
+      "start": 1.1,
+      "end": 2.2,
+      "label": "G"
+    },
+    {
+      "start": 2.2,
+      "end": 3.3000000000000003,
+      "label": "Am"
+    },
+    {
+      "start": 3.3,
+      "end": 4.4,
+      "label": "F"
+    }
+  ]
+}

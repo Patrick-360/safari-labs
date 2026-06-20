@@ -4,6 +4,7 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from pydantic import ValidationError
 
 from app.audio.analyze_pipeline import run_analysis
+from app.audio.chord_analysis_preset import DEFAULT_CHORD_ENGINE
 from app.schemas.analyze import AnalyzeResponse
 
 router = APIRouter()
@@ -20,6 +21,13 @@ async def analyze_track(
 		default=False,
 		description="When true, attempt optional accompaniment separation for chord/key paths (fallback safe if deps missing)",
 	),
+	engine: str | None = Query(
+		default=None,
+		description=(
+			"Chord analysis engine preset: stable | theory | experimental. "
+			f"Omit for default `{DEFAULT_CHORD_ENGINE}`."
+		),
+	),
 ) -> AnalyzeResponse:
 	"""
 	Full-song analysis: duration, tempo (BPM), global key + confidence, chord segments.
@@ -35,7 +43,12 @@ async def analyze_track(
 					"message": "No audio bytes were received. Use form field name 'file', or ensure the file is non-empty.",
 				},
 			)
-		payload = run_analysis(audio_bytes, debug=debug, use_source_separation=use_source_separation)
+		payload = run_analysis(
+			audio_bytes,
+			debug=debug,
+			use_source_separation=use_source_separation,
+			engine=engine,
+		)
 		try:
 			return AnalyzeResponse.model_validate(payload)
 		except ValidationError as exc:

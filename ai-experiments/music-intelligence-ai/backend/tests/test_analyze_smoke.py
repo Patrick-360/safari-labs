@@ -32,6 +32,7 @@ class TestAnalyzeSmoke(unittest.TestCase):
 		self.assertEqual(res.status_code, 200, res.text)
 		data = res.json()
 		self.assertIn("duration", data)
+		self.assertEqual(data.get("chord_engine"), "theory")
 		self.assertIn("tempo", data)
 		self.assertIn("key", data)
 		self.assertIn("label", data["key"])
@@ -64,6 +65,13 @@ class TestAnalyzeSmoke(unittest.TestCase):
 			self.assertIn("low_confidence", c0)
 			self.assertIn("is_passing", c0)
 			self.assertIn("chord_role", c0)
+
+	def test_analyze_engine_stable_parameter(self) -> None:
+		client = TestClient(app)
+		wav_bytes = one_second_silent_wav()
+		res = client.post("/analyze", params={"engine": "stable"}, files={"file": ("test.wav", wav_bytes, "audio/wav")})
+		self.assertEqual(res.status_code, 200, res.text)
+		self.assertEqual(res.json().get("chord_engine"), "stable")
 
 
 if __name__ == "__main__":

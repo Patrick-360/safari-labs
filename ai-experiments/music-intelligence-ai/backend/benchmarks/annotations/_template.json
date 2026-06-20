@@ -1,0 +1,11 @@
+{
+  "title": "Example clip (rename and duplicate this file)",
+  "audio_file": "example.wav",
+  "key": "C major",
+  "chords": [
+    { "start": 0.0, "end": 2.0, "label": "C" },
+    { "start": 2.0, "end": 4.0, "label": "G" },
+    { "start": 4.0, "end": 6.0, "label": "Am" },
+    { "start": 6.0, "end": 8.0, "label": "F" }
+  ]
+}

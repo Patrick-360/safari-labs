@@ -155,6 +155,14 @@ type TranscribeDebugSnapshot = {
   lastLtClientTimelineSegEcho: string;
   lastProgressionSource: string;
   lastProgressionQuality: string;
+  /** Flattened hints from `/live-transcribe` extended debug (`debug=true`) */
+  ltKeyUpdatedWindow: string;
+  ltProgressionUpdatedWindow: string;
+  ltWhyProgressionEmpty: string;
+  ltHarmonicPrefetchRms: string;
+  /** Compact preflight line when debug=true (RMS · peak · nsr · harmonic RMS) */
+  ltPrefetchAggregate: string;
+  ltListenRejectionReason: string;
 };
 
 const TRANSCRIBE_DEBUG_INITIAL: TranscribeDebugSnapshot = {
@@ -175,6 +183,12 @@ const TRANSCRIBE_DEBUG_INITIAL: TranscribeDebugSnapshot = {
   lastLtClientTimelineSegEcho: "—",
   lastProgressionSource: "—",
   lastProgressionQuality: "—",
+  ltKeyUpdatedWindow: "—",
+  ltProgressionUpdatedWindow: "—",
+  ltWhyProgressionEmpty: "—",
+  ltHarmonicPrefetchRms: "—",
+  ltPrefetchAggregate: "—",
+  ltListenRejectionReason: "—",
 };
 
 type LiveDebugSnapshot = {
@@ -263,6 +277,11 @@ type LiveDebugSnapshot = {
   lastStreamChordCommitKind: string;
   /** Last <code>debug.displayed_chord</code> (what the JSON <code>chord</code> field carried) */
   lastStreamDisplayedChord: string;
+  lastBackendHarmonicHpssRms: number | null;
+  lastBackendNonSilentRatio: number | null;
+  /** From <code>debug.live_route_active</code> — always Instant Live preset id for `/stream` */
+  lastBackendLiveRoute: string;
+  lastBackendKeyUpdatedThisChunk: string;
   lastFetchError: string;
   lastUiError: string;
   ignoredResponseReason: string;
@@ -328,6 +347,10 @@ const LIVE_DEBUG_INITIAL: LiveDebugSnapshot = {
   lastStreamHeldLastValid: null,
   lastStreamChordCommitKind: "—",
   lastStreamDisplayedChord: "—",
+  lastBackendHarmonicHpssRms: null,
+  lastBackendNonSilentRatio: null,
+  lastBackendLiveRoute: "—",
+  lastBackendKeyUpdatedThisChunk: "—",
   lastFetchError: "—",
   lastUiError: "—",
   ignoredResponseReason: "—",
@@ -372,6 +395,12 @@ type StreamDebug = {
   smoothed_key_raw_internal?: string;
   chord_commit_kind?: string;
   displayed_chord?: string;
+  harmonic_hpss_rms?: number;
+  non_silent_ratio?: number | null;
+  live_route_active?: string;
+  preset_live_route?: string;
+  key_updated_this_chunk?: boolean;
+  preset_too_quiet_streak_clear?: number;
 };
 
 type StreamResponse = {
@@ -407,16 +436,32 @@ type AnalyzeChordSeg = {
   exclude_from_core?: boolean;
 };
 
+type AnalyzeChordEngineId = "stable" | "theory" | "experimental";
+
 type AnalyzeApiResponse = {
   duration: number;
   tempo: number;
   key: { label: string; confidence: number };
+  chord_engine?: AnalyzeChordEngineId;
   chords: AnalyzeChordSeg[];
   beats: { time: number }[];
   sections: { index: number; start: number; end: number; label: string; repeat_group?: string | null }[];
   rhythm?: AnalyzeRhythm;
   debug?: Record<string, unknown>;
 };
+
+function normalizeChordEngineFromApi(engine: unknown): AnalyzeChordEngineId {
+  if (engine === "stable" || engine === "theory" || engine === "experimental") {
+    return engine;
+  }
+  return "theory";
+}
+
+function chordEngineUiLabel(engine: AnalyzeChordEngineId): string {
+  if (engine === "stable") return "Stable";
+  if (engine === "experimental") return "Experimental (noisier)";
+  return "Theory enhanced";
+}
 
 type ChordRun = {
   startSeg: number;
@@ -1013,6 +1058,7 @@ export default function Home() {
   const [analyzeResult, setAnalyzeResult] = useState<AnalyzeApiResponse | null>(null);
   const [analyzeLoading, setAnalyzeLoading] = useState(false);
   const [analyzeQueryDebug, setAnalyzeQueryDebug] = useState(false);
+  const [analyzeChordEngine, setAnalyzeChordEngine] = useState<AnalyzeChordEngineId>("theory");
   const [analyzeUseSourceSeparation, setAnalyzeUseSourceSeparation] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
   const [analyzeAudioUrl, setAnalyzeAudioUrl] = useState<string | null>(null);
@@ -1205,7 +1251,18 @@ export default function Home() {
     [analyzeResult?.chords],
   );
 
-  const coreProgression = useMemo(() => deriveCoreProgression(chordRuns), [chordRuns]);
+  const coreProgressionResult = useMemo(() => deriveCoreProgression(chordRuns), [chordRuns]);
+  const coreProgression = coreProgressionResult.entries;
+
+  const analyzeDebugDisplay = useMemo(() => {
+    const dbg = analyzeResult?.debug;
+    if (!dbg || typeof dbg !== "object") return null;
+    return {
+      ...dbg,
+      core_progression_fallback_used: coreProgressionResult.fallbackUsed,
+      core_progression_fallback_reason: coreProgressionResult.fallbackReason,
+    };
+  }, [analyzeResult?.debug, coreProgressionResult.fallbackReason, coreProgressionResult.fallbackUsed]);
 
   const coreProgressionDisplay = useMemo(() => {
     const n = displayTransposeSemitones;
@@ -1678,6 +1735,16 @@ export default function Home() {
           d?.chord_commit_kind != null && String(d.chord_commit_kind) !== "" ? String(d.chord_commit_kind) : "—",
         lastStreamDisplayedChord:
           d?.displayed_chord != null && String(d.displayed_chord) !== "" ? String(d.displayed_chord) : "—",
+        lastBackendHarmonicHpssRms: typeof d?.harmonic_hpss_rms === "number" ? d.harmonic_hpss_rms : null,
+        lastBackendNonSilentRatio: typeof d?.non_silent_ratio === "number" ? d.non_silent_ratio : null,
+        lastBackendLiveRoute:
+          typeof d?.live_route_active === "string" && d.live_route_active
+            ? String(d.live_route_active)
+            : typeof d?.preset_live_route === "string"
+              ? String(d.preset_live_route)
+              : "—",
+        lastBackendKeyUpdatedThisChunk:
+          typeof d?.key_updated_this_chunk === "boolean" ? String(d.key_updated_this_chunk) : "—",
         lastFetchError: "—",
         ignoredResponseReason: ignored,
       }));
@@ -1876,6 +1943,23 @@ export default function Home() {
       }
 
       const dbg = data.debug;
+
+      const pmRaw = dbg?.preflight_metrics;
+      const pm = pmRaw && typeof pmRaw === "object" ? (pmRaw as Record<string, unknown>) : null;
+      const prefetchAgg = pm
+        ? `${pm.waveform_rms ?? "—"} rms · ${pm.waveform_peak ?? "—"} pk · ${pm.non_silent_ratio ?? "—"} nsr · ${
+            pm.hpss_harmonic_rms ?? "—"
+          } harm`
+        : "—";
+      const listenReject =
+        dbg && typeof dbg.listening_reason === "string"
+          ? String(dbg.listening_reason)
+          : dbg && typeof dbg.rejection_reason === "string"
+            ? String(dbg.rejection_reason)
+            : data.status !== "ready" && typeof data.progression_meta?.empty_reason === "string"
+              ? String(data.progression_meta.empty_reason)
+              : "—";
+
       setTranscribeDebug((p) => ({
         ...p,
         lastRequestStatus: `HTTP ${res.status} OK`,
@@ -1907,37 +1991,68 @@ export default function Home() {
             : "—",
         lastProgressionSource: data.progression_meta?.source ?? "—",
         lastProgressionQuality: data.progression_meta?.quality ?? "—",
+        ltKeyUpdatedWindow:
+          dbg && typeof dbg.key_updated_this_window === "boolean" ? String(dbg.key_updated_this_window) : "—",
+        ltProgressionUpdatedWindow:
+          dbg && typeof dbg.progression_updated_this_window === "boolean"
+            ? String(dbg.progression_updated_this_window)
+            : "—",
+        ltWhyProgressionEmpty:
+          dbg && typeof dbg.why_progression_empty === "string"
+            ? dbg.why_progression_empty
+            : typeof dbg?.progression_empty_reason === "string"
+              ? dbg.progression_empty_reason
+              : typeof data.progression_meta?.empty_reason === "string"
+                ? String(data.progression_meta.empty_reason)
+                : "—",
+        ltHarmonicPrefetchRms:
+          dbg && dbg.preflight_metrics && typeof dbg.preflight_metrics === "object"
+            ? String(
+                (dbg.preflight_metrics as Record<string, unknown>).hpss_harmonic_rms ??
+                  (dbg.preflight_metrics as Record<string, unknown>).harmonic ??
+                  "—",
+              )
+            : "—",
+        ltPrefetchAggregate: prefetchAgg,
+        ltListenRejectionReason: listenReject,
       }));
+
+      const maskedListen = data.status !== "ready";
 
       setLiveServerCoreLabels((data.core_progression ?? []).map((c) => c.label));
       setLiveProgressionMeta(data.progression_meta ?? null);
       setLiveLastWindowChords(
-        (data.chords ?? []).map((c) => ({
-          label: c.label,
-          start: c.start,
-          end: c.end,
-          low_confidence: c.low_confidence,
-          confidence: c.confidence,
-        })),
+        maskedListen
+          ? []
+          : (data.chords ?? []).map((c) => ({
+              label: c.label,
+              start: c.start,
+              end: c.end,
+              low_confidence: c.low_confidence,
+              confidence: c.confidence,
+            })),
       );
 
-      setTranscribeKey((prev) =>
-        mergeLiveTranscribeKey(prev, {
-          label: data.key.label,
-          confidence: data.key.confidence,
-        }),
-      );
+      if (!maskedListen && data.key.label !== "—") {
+        setTranscribeKey((prev) =>
+          mergeLiveTranscribeKey(prev, {
+            label: data.key.label,
+            confidence: data.key.confidence,
+          }),
+        );
+      }
+
       setTranscribeTimeline((prev) =>
         mergeTranscribeTimeline(
           prev,
           data.window_start,
           data.window_end,
-          (data.chords ?? []).filter((c) => c.label !== "N"),
+          maskedListen ? [] : (data.chords ?? []).filter((c) => c.label !== "N"),
           TRANSCRIBE_TIMELINE_KEEP_SEC,
         ),
       );
-      setTranscribeCurrentChord(transcribeChordDisplay(data.current_chord));
-      setTranscribeCurrentNotes(transcribePickCurrentNotes(data));
+      setTranscribeCurrentChord(maskedListen ? "—" : transcribeChordDisplay(data.current_chord));
+      setTranscribeCurrentNotes(maskedListen ? [] : transcribePickCurrentNotes(data));
       setTranscribeSummary(data.summary ?? "");
       setTranscribePhase(data.status === "ready" ? "ready" : "listening");
     } finally {
@@ -2183,6 +2298,7 @@ export default function Home() {
       fd.append("file", analyzeFile);
       const params = new URLSearchParams();
       params.set("debug", analyzeQueryDebug ? "true" : "false");
+      params.set("engine", analyzeChordEngine);
       params.set("use_source_separation", analyzeUseSourceSeparation ? "true" : "false");
       const res = await fetch(`${API_BASE}/analyze?${params.toString()}`, {
         method: "POST",
@@ -2205,7 +2321,7 @@ export default function Home() {
     } finally {
       setAnalyzeLoading(false);
     }
-  }, [analyzeFile, analyzeQueryDebug, analyzeUseSourceSeparation]);
+  }, [analyzeFile, analyzeChordEngine, analyzeQueryDebug, analyzeUseSourceSeparation]);
 
   const syncAnalyzePlaybackFromElement = useCallback(
     (el: HTMLAudioElement) => {
@@ -2395,19 +2511,20 @@ export default function Home() {
     const chips = liveDisplayProgressionChips;
     if (!chips.length) {
       const r = liveProgressionMeta?.empty_reason;
-      let primary = "Still listening for the progression…";
-      if (r === "all_low_confidence") {
+      let primary = "Still listening for a stable progression…";
+      let secondary: string | undefined =
+        r && r !== "waiting_for_more_audio" ? `Reason: ${r.replace(/_/g, " ")}` : undefined;
+      if (r === "input_too_quiet") {
+        primary = "Input is quiet — move closer, raise volume, or increase input boost.";
+        secondary = undefined;
+      } else if (r === "all_low_confidence") {
         primary = "Still listening";
+        secondary = "Harmony reads uncertain — try a clearer moment or louder chords.";
       }
       return {
         chips,
         qualityPrimary: primary,
-        qualitySecondary:
-          r === "all_low_confidence"
-            ? "Harmony reads uncertain — try a clearer moment or louder chords."
-            : r && r !== "waiting_for_more_audio"
-              ? `Reason: ${r.replace(/_/g, " ")}`
-              : undefined,
+        qualitySecondary: secondary,
       };
     }
     if (liveDerivedProgression.chipLabels.length) {
@@ -2973,7 +3090,7 @@ export default function Home() {
                   (liveDisplayProgressionChips.length > 0 &&
                     liveDisplayProgressionChips.length < 2 &&
                     liveDerivedProgression.chipLabels.length === 0) ? (
-                    <p className="live-progression-pattern-hint">Still listening for the pattern…</p>
+                    <p className="live-progression-pattern-hint">Still listening for a stable progression…</p>
                   ) : null}
                   {liveDisplayProgressionChips.length > 0 ? (
                     <div className="live-progression-chips" aria-label="Main progression chords to try first">
@@ -2990,7 +3107,7 @@ export default function Home() {
                     </div>
                   ) : (
                     <p className="live-transcribe-progression-line live-transcribe-progression-line--empty">
-                      Still listening for the progression…
+                      Still listening for a stable progression…
                     </p>
                   )}
                   {liveDisplayProgressionChips.length > 0 && transcribeKey?.label && transcribeKey.label !== "—" ? (
@@ -3193,6 +3310,16 @@ export default function Home() {
                 {formatOptionalFloat(liveDebug.lastBackendWaveformRms, 6)} /{" "}
                 {formatOptionalFloat(liveDebug.lastBackendWaveformPeak, 6)}
               </dd>
+              <dt>Harmonic RMS (HPSS stem) · non-silent ratio</dt>
+              <dd>
+                {formatOptionalFloat(liveDebug.lastBackendHarmonicHpssRms, 6)} ·{" "}
+                {formatOptionalFloat(liveDebug.lastBackendNonSilentRatio, 4)}{" "}
+                <span className="live-debug-muted">(`/stream` harmonic + activity gates)</span>
+              </dd>
+              <dt>Live route · key updated (chunk)</dt>
+              <dd>
+                <code>{liveDebug.lastBackendLiveRoute}</code> · {liveDebug.lastBackendKeyUpdatedThisChunk}
+              </dd>
               <dt>Template scores: best / second / margin</dt>
               <dd>
                 {formatOptionalFloat(liveDebug.lastBackendBestScore, 3)} / {formatOptionalFloat(liveDebug.lastBackendSecondScore, 3)}{" "}
@@ -3245,6 +3372,23 @@ export default function Home() {
                 <dt>Progression source / quality (API)</dt>
                 <dd>
                   <code>{transcribeDebug.lastProgressionSource}</code> · <code>{transcribeDebug.lastProgressionQuality}</code>
+                </dd>
+                <dt>Key updated · progression updated (last window)</dt>
+                <dd>
+                  {transcribeDebug.ltKeyUpdatedWindow} · {transcribeDebug.ltProgressionUpdatedWindow}{" "}
+                  <span className="live-debug-muted">(needs server <code>debug=true</code>)</span>
+                </dd>
+                <dt>Why progression empty?</dt>
+                <dd>
+                  <code>{transcribeDebug.ltWhyProgressionEmpty}</code>
+                </dd>
+                <dt>Preflight (RMS · peak · nsr · harmonic RMS)</dt>
+                <dd>
+                  <code>{transcribeDebug.ltPrefetchAggregate}</code>
+                </dd>
+                <dt>Listen / gate rejection (last window)</dt>
+                <dd>
+                  <code>{transcribeDebug.ltListenRejectionReason}</code>
                 </dd>
                 <dt>Segment counts (server debug)</dt>
                 <dd>{transcribeDebug.lastLtServerSegmentSummary}</dd>
@@ -3333,6 +3477,26 @@ export default function Home() {
           </div>
 
           <div className="analyze-sep-advanced">
+            <div className="analyze-loop-row analyze-chord-engine-row">
+              <label htmlFor="analyze-chord-engine" className="muted-hint analyze-chord-engine-label">
+                Chord engine
+              </label>
+              <select
+                id="analyze-chord-engine"
+                value={analyzeChordEngine}
+                onChange={(e) =>
+                  setAnalyzeChordEngine(normalizeChordEngineFromApi(e.target.value))
+                }
+              >
+                <option value="stable">Stable</option>
+                <option value="theory">Theory enhanced</option>
+                <option value="experimental">Experimental (noisier)</option>
+              </select>
+            </div>
+            <p className="muted-hint analyze-sep-hint analyze-chord-engine-hint">
+              Stable is best for simple songs. Theory enhanced (default) handles vocals, 7ths, and R&amp;B harmony
+              more carefully. Experimental may be noisier — use for A/B tests only.
+            </p>
             <label className="muted-hint analyze-debug-api-label">
               <input
                 type="checkbox"
@@ -3403,6 +3567,12 @@ export default function Home() {
                     <span className="analyze-song-stat-value">{Math.round(analyzeResult.tempo)} BPM</span>
                   </div>
                   <div className="analyze-song-stat">
+                    <span className="analyze-song-stat-label">Chord engine</span>
+                    <span className="analyze-song-stat-value">
+                      {chordEngineUiLabel(normalizeChordEngineFromApi(analyzeResult.chord_engine))}
+                    </span>
+                  </div>
+                  <div className="analyze-song-stat">
                     <span className="analyze-song-stat-label">Length</span>
                     <span className="analyze-song-stat-value">{formatTimeSec(analyzePlaybackDuration)}</span>
                   </div>
@@ -3421,10 +3591,10 @@ export default function Home() {
                   value={displayTransposeSemitones}
                   onChange={setDisplayTransposeSemitones}
                 />
-                {analyzeResult.debug && typeof analyzeResult.debug === "object" ? (
+                {analyzeDebugDisplay ? (
                   <details className="analyze-api-debug">
                     <summary className="muted-hint">Server analysis debug (requested)</summary>
-                    <pre className="analyze-api-debug-pre">{JSON.stringify(analyzeResult.debug, null, 2)}</pre>
+                    <pre className="analyze-api-debug-pre">{JSON.stringify(analyzeDebugDisplay, null, 2)}</pre>
                   </details>
                 ) : null}
               </div>

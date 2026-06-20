@@ -28,7 +28,15 @@ from app.audio.features import (
 	waveform_peak_abs,
 	waveform_rms,
 )
+from app.audio.live_thresholds import (
+	LIVE_ROUTE_INSTANT_LIVE,
+	SEMANTIC_INSTANT_LIVE_CLEAN,
+	SEMANTIC_INSTANT_LIVE_DEBUG,
+	SEMANTIC_INSTANT_LIVE_SONG,
+	canon_stream_rejection,
+)
 from app.audio.music_theory import blend_chroma_mean_max
+from app.audio.live_window_energy import hpss_harmonic_rms, waveform_non_silent_ratio
 from app.models.chords import build_chord_templates
 
 from app.models.chords import _normalize_vector, _validate_chroma
@@ -40,6 +48,8 @@ LAST_VALID_KEY: str = ""
 LAST_VALID_KEY_CONFIDENCE: float = 0.0
 LAST_VALID_CHORD: str = ""
 SILENCE_STREAK: int = 0
+# Sub-threshold RMS/peak bursts (noise floor, not deep silence): clear held harmony quickly.
+TOO_QUIET_STREAK: int = 0
 
 KEY_CHROMA_EMA: np.ndarray | None = None
 KEY_CHROMA_RING: list[np.ndarray] = []
@@ -60,21 +70,26 @@ CHORD_TEMPLATES = build_chord_templates()
 @dataclass(frozen=True)
 class LiveStreamSensPreset:
 	"""
-	Named threshold bundle for POST /stream (live mic). Tune per mode in LIVE_STREAM_PRESETS only.
+	Instant Live `/stream` threshold bundle — **not** used by Analyze File.
 
-	Tradeoffs (high level):
-	- instrument: harmonic HPSS + blended chroma; strong OR “fast-stable” one-chunk accept when steady; two weak chunks
-	  for marginal evidence; invalid streak clears held chord a bit sooner.
-	- song: favors faster chord swaps on phone→mic audio; shorter silence/invalid holds; one weak chunk;
-	  optional medium-fast commit between “weak” and “strong” template scores.
-	- debug: permissive gates for engineering only; optional fast-stable tier for quicker experimentation.
+	Microphone chunks lack the temporal context `/analyze` has; RMS + HPSS harmonic gates stay
+	per-preset below. See ``app/audio/live_thresholds.py`` module doc for the split rationale.
 	"""
 
 	preset_id: str
-	# Human-readable label returned in JSON debug for the Live panel.
 	display_name: str
+	live_route: str
+
 	silence_rms_threshold: float
-	live_min_peak: float
+	min_signal_rms: float
+	min_signal_peak: float
+	min_hpss_harmonic_rms: float
+	min_non_silent_ratio: float
+	peak_frac_for_non_silent: float
+
+	silence_streak_clear: int
+	too_quiet_streak_clear: int
+
 	max_crest_ratio: float
 	min_best_score_accept: float
 	ambiguity_margin: float
@@ -86,100 +101,119 @@ class LiveStreamSensPreset:
 	min_strong_chroma_bins: int
 	single_note_escape_best_score: float
 	weak_confirm_chunks: int
-	# Consecutive sub-silence RMS chunks before LAST_VALID_CHORD is cleared (smaller = less sticky).
-	silence_streak_clear: int
-	# Consecutive harmonic-gate rejects before forcing clear_display (smaller = drop stale chord faster).
 	invalid_streak_clear_display: int
-	# If set: accept new chord in one chunk when score/margin reach this tier (song mode “medium” evidence).
 	medium_fast_best_score: float | None
 	medium_fast_margin: float | None
-	# Instrument path: one-chunk accept when template is good and chroma is already steady (piano/guitar).
 	fast_stable_best_score: float | None
 	fast_stable_margin: float | None
 	fast_stable_chroma_stability: float | None
 
 
-# --- Preset dictionaries (explicit tuning anchors; do not scatter magic numbers elsewhere) ---
+# Instant Live presets (`LIVE_ROUTE_INSTANT_LIVE`); Analyze File unaffected.
 PRESET_CLEAN_INSTRUMENT = LiveStreamSensPreset(
 	preset_id="instrument",
 	display_name="Clean instrument (strict)",
-	silence_rms_threshold=3.0e-4,
-	live_min_peak=7.0e-4,
-	max_crest_ratio=22.0,
-	min_best_score_accept=0.34,
-	ambiguity_margin=0.062,
-	ambiguity_best_max=0.50,
-	strong_best_score=0.44,
-	strong_margin=0.092,
-	max_chroma_entropy=2.12,
-	min_chroma_stability=0.64,
+	live_route=LIVE_ROUTE_INSTANT_LIVE,
+	silence_rms_threshold=4.65e-4,
+	min_signal_rms=7.1e-4,
+	min_signal_peak=1.18e-3,
+	min_hpss_harmonic_rms=1.42e-4,
+	min_non_silent_ratio=0.05,
+	peak_frac_for_non_silent=0.065,
+	silence_streak_clear=3,
+	too_quiet_streak_clear=2,
+	max_crest_ratio=20.8,
+	min_best_score_accept=0.375,
+	ambiguity_margin=0.064,
+	ambiguity_best_max=0.475,
+	strong_best_score=0.445,
+	strong_margin=0.094,
+	max_chroma_entropy=2.04,
+	min_chroma_stability=0.665,
 	min_strong_chroma_bins=2,
-	single_note_escape_best_score=0.43,
+	single_note_escape_best_score=0.445,
 	weak_confirm_chunks=2,
-	silence_streak_clear=4,
-	invalid_streak_clear_display=3,
+	invalid_streak_clear_display=2,
 	medium_fast_best_score=None,
 	medium_fast_margin=None,
-	fast_stable_best_score=0.38,
-	fast_stable_margin=0.070,
-	fast_stable_chroma_stability=0.71,
+	fast_stable_best_score=0.395,
+	fast_stable_margin=0.074,
+	fast_stable_chroma_stability=0.725,
 )
 
-# Song: noisier path — faster updates, less holding, extra one-chord “medium” accept tier.
+
 PRESET_SONG_PLAYBACK = LiveStreamSensPreset(
 	preset_id="song",
 	display_name="Song playback (experimental — phone/speaker → mic)",
-	silence_rms_threshold=1.2e-4,
-	live_min_peak=2.5e-4,
-	max_crest_ratio=27.0,
-	min_best_score_accept=0.26,
-	ambiguity_margin=0.038,
-	ambiguity_best_max=0.58,
-	strong_best_score=0.36,
-	strong_margin=0.062,
-	max_chroma_entropy=2.38,
-	min_chroma_stability=0.48,
-	min_strong_chroma_bins=2,
-	single_note_escape_best_score=0.34,
-	weak_confirm_chunks=1,
+	live_route=LIVE_ROUTE_INSTANT_LIVE,
+	silence_rms_threshold=3.15e-4,
+	min_signal_rms=5.75e-4,
+	min_signal_peak=9.5e-4,
+	min_hpss_harmonic_rms=1.22e-4,
+	min_non_silent_ratio=0.05,
+	peak_frac_for_non_silent=0.052,
 	silence_streak_clear=3,
+	too_quiet_streak_clear=2,
+	max_crest_ratio=24.8,
+	min_best_score_accept=0.34,
+	ambiguity_margin=0.05,
+	ambiguity_best_max=0.522,
+	strong_best_score=0.394,
+	strong_margin=0.074,
+	max_chroma_entropy=2.12,
+	min_chroma_stability=0.56,
+	min_strong_chroma_bins=2,
+	single_note_escape_best_score=0.392,
+	weak_confirm_chunks=2,
 	invalid_streak_clear_display=3,
-	medium_fast_best_score=0.30,
-	medium_fast_margin=0.044,
+	medium_fast_best_score=0.322,
+	medium_fast_margin=0.049,
 	fast_stable_best_score=None,
 	fast_stable_margin=None,
 	fast_stable_chroma_stability=None,
 )
 
+
 PRESET_DEBUG_RAW = LiveStreamSensPreset(
 	preset_id="debug",
-	display_name="Debug / raw (testing only — weak filtering)",
-	silence_rms_threshold=8.0e-5,
-	live_min_peak=1.0e-4,
-	max_crest_ratio=34.0,
-	min_best_score_accept=0.22,
-	ambiguity_margin=0.022,
-	ambiguity_best_max=0.66,
-	strong_best_score=0.30,
-	strong_margin=0.038,
-	max_chroma_entropy=2.62,
-	min_chroma_stability=0.40,
-	min_strong_chroma_bins=1,
-	single_note_escape_best_score=0.24,
-	weak_confirm_chunks=1,
+	display_name="Debug / raw (permissive — labeling only)",
+	live_route=LIVE_ROUTE_INSTANT_LIVE,
+	silence_rms_threshold=9.5e-5,
+	min_signal_rms=1.85e-4,
+	min_signal_peak=3.05e-4,
+	min_hpss_harmonic_rms=5.8e-5,
+	min_non_silent_ratio=0.018,
+	peak_frac_for_non_silent=0.032,
 	silence_streak_clear=4,
+	too_quiet_streak_clear=4,
+	max_crest_ratio=33.0,
+	min_best_score_accept=0.23,
+	ambiguity_margin=0.026,
+	ambiguity_best_max=0.645,
+	strong_best_score=0.31,
+	strong_margin=0.042,
+	max_chroma_entropy=2.55,
+	min_chroma_stability=0.415,
+	min_strong_chroma_bins=1,
+	single_note_escape_best_score=0.26,
+	weak_confirm_chunks=1,
 	invalid_streak_clear_display=4,
-	medium_fast_best_score=0.26,
-	medium_fast_margin=0.032,
-	fast_stable_best_score=0.33,
-	fast_stable_margin=0.055,
-	fast_stable_chroma_stability=0.55,
+	medium_fast_best_score=0.27,
+	medium_fast_margin=0.036,
+	fast_stable_best_score=0.34,
+	fast_stable_margin=0.058,
+	fast_stable_chroma_stability=0.56,
 )
 
 LIVE_STREAM_PRESETS: Dict[str, LiveStreamSensPreset] = {
 	PRESET_CLEAN_INSTRUMENT.preset_id: PRESET_CLEAN_INSTRUMENT,
 	PRESET_SONG_PLAYBACK.preset_id: PRESET_SONG_PLAYBACK,
 	PRESET_DEBUG_RAW.preset_id: PRESET_DEBUG_RAW,
+}
+_SEMANTIC_BY_STREAM_PRESET = {
+	PRESET_CLEAN_INSTRUMENT.preset_id: SEMANTIC_INSTANT_LIVE_CLEAN,
+	PRESET_SONG_PLAYBACK.preset_id: SEMANTIC_INSTANT_LIVE_SONG,
+	PRESET_DEBUG_RAW.preset_id: SEMANTIC_INSTANT_LIVE_DEBUG,
 }
 
 
@@ -248,8 +282,11 @@ EPS = 1e-8
 def _preset_tune_debug(p: LiveStreamSensPreset) -> Dict[str, object]:
 	"""Compact tuning fields for Live debug / API consumers."""
 	out: Dict[str, object] = {
+		"live_preset_semantic": _SEMANTIC_BY_STREAM_PRESET.get(p.preset_id, ""),
+		"live_route_expected": p.live_route,
 		"preset_weak_confirm_chunks": p.weak_confirm_chunks,
 		"preset_silence_streak_clear": p.silence_streak_clear,
+		"preset_too_quiet_streak_clear": p.too_quiet_streak_clear,
 		"preset_invalid_streak_clear": p.invalid_streak_clear_display,
 		"preset_strong_best": p.strong_best_score,
 		"preset_strong_margin": p.strong_margin,
@@ -527,6 +564,7 @@ def _fallback_key() -> Tuple[str, float]:
 def _gates_harmonic(
 	preset: LiveStreamSensPreset,
 	*,
+	harmonic_hpss_rms: float,
 	peak_chunk: float,
 	rms_chunk: float,
 	entropy: float,
@@ -535,8 +573,10 @@ def _gates_harmonic(
 	best_score: float,
 	confidence: float,
 ) -> str | None:
-	"""Return rejection_reason_code or None if hard-gate passed."""
-	if peak_chunk < preset.live_min_peak:
+	"""Return internal rejection code or None if hard-gate passed (canonicalized separately for UI/debug)."""
+	if harmonic_hpss_rms + 1e-15 < preset.min_hpss_harmonic_rms:
+		return "not_harmonic"
+	if peak_chunk < preset.min_signal_peak:
 		return "weak_signal"
 	crest = peak_chunk / (rms_chunk + 1e-10)
 	if crest > preset.max_crest_ratio:
@@ -559,12 +599,15 @@ def _stream_response_debug(
 	*,
 	raw_mapped: str,
 	final_chord: str,
-	rejection_reason: str,
+	rejection_reason_canon: str,
 	accepted: bool,
 	clear_display: bool,
+	key_updated_this_chunk: bool,
 	scores_top3: List[Tuple[str, float]],
 	rms_chunk: float,
 	peak_chunk: float,
+	harmonic_hpss_rms: float,
+	non_silent_ratio: float | None,
 	best_score: float,
 	second_score: float,
 	confidence: float,
@@ -588,13 +631,16 @@ def _stream_response_debug(
 	)
 	ik_conf = None if instant_key_confidence is None else round(float(instant_key_confidence), 4)
 	dc = displayed_chord if displayed_chord is not None else final_chord
+	nsr_round = None if non_silent_ratio is None else round(float(non_silent_ratio), 5)
 	out: Dict[str, object] = {
+		"live_route_active": LIVE_ROUTE_INSTANT_LIVE,
 		"raw_chord": raw_mapped,
 		"final_chord": final_chord,
 		"displayed_chord": dc,
 		"chord_commit_kind": chord_commit_kind,
-		"rejection_reason": rejection_reason,
+		"rejection_reason": rejection_reason_canon,
 		"accepted": accepted,
+		"key_updated_this_chunk": bool(key_updated_this_chunk),
 		"clear_display": clear_display,
 		"held_last_valid_chord": held_last_valid,
 		"key_display_source": key_display_source,
@@ -604,6 +650,8 @@ def _stream_response_debug(
 		"scores_top3": [(name, float(score)) for name, score in scores_top3],
 		"waveform_rms": rms_chunk,
 		"waveform_peak": peak_chunk,
+		"harmonic_hpss_rms": round(float(harmonic_hpss_rms), 8),
+		"non_silent_ratio": nsr_round,
 		"best_score": best_score,
 		"second_score": second_score,
 		"confidence": float(confidence),
@@ -627,16 +675,22 @@ async def stream_audio(
 ) -> Dict[str, object]:
 	global SILENCE_STREAK, LAST_VALID_CHORD, LAST_VALID_KEY, LAST_VALID_KEY_CONFIDENCE
 	global WEAK_PENDING_LABEL, WEAK_PENDING_STREAK, NO_ACCEPT_STREAK, LAST_STREAM_MODE, LAST_KEY_RAW
+	global TOO_QUIET_STREAK
 
 	preset = _get_live_stream_preset(mode)
 	if preset.preset_id != LAST_STREAM_MODE:
 		WEAK_PENDING_LABEL = ""
 		WEAK_PENDING_STREAK = 0
 		NO_ACCEPT_STREAK = 0
+		TOO_QUIET_STREAK = 0
 		_clear_recent_accepted_chords()
 	LAST_STREAM_MODE = preset.preset_id
 
-	mode_fields = {"input_mode": preset.preset_id, "preset_name": preset.display_name}
+	mode_fields = {
+		"input_mode": preset.preset_id,
+		"preset_name": preset.display_name,
+		"preset_live_route": preset.live_route,
+	}
 
 	try:
 		audio_bytes = await file.read()
@@ -649,14 +703,15 @@ async def stream_audio(
 
 	if rms_chunk < preset.silence_rms_threshold:
 		SILENCE_STREAK += 1
+		TOO_QUIET_STREAK = 0
 		WEAK_PENDING_LABEL = ""
 		WEAK_PENDING_STREAK = 0
 		if SILENCE_STREAK >= preset.silence_streak_clear:
 			LAST_VALID_CHORD = ""
 			NO_ACCEPT_STREAK = 0
 			_clear_recent_accepted_chords()
-		chord_out = LAST_VALID_CHORD if LAST_VALID_CHORD else "N"
-		clear_display = not bool(LAST_VALID_CHORD) and SILENCE_STREAK >= preset.silence_streak_clear
+		clear_display = SILENCE_STREAK >= preset.silence_streak_clear
+		chord_out = "N"
 		key_label, key_confidence = _fallback_key()
 		return {
 			"chord": chord_out,
@@ -668,12 +723,15 @@ async def stream_audio(
 				preset,
 				raw_mapped="N",
 				final_chord=chord_out,
-				rejection_reason="silence",
+				rejection_reason_canon=canon_stream_rejection("silence"),
 				accepted=False,
 				clear_display=clear_display,
+				key_updated_this_chunk=False,
 				scores_top3=[],
 				rms_chunk=rms_chunk,
 				peak_chunk=peak_chunk,
+				harmonic_hpss_rms=0.0,
+				non_silent_ratio=None,
 				best_score=0.0,
 				second_score=0.0,
 				confidence=0.0,
@@ -691,6 +749,63 @@ async def stream_audio(
 		}
 
 	SILENCE_STREAK = 0
+
+	harms_rms_chunk = hpss_harmonic_rms(y)
+	ns_ratio = waveform_non_silent_ratio(y, peak_chunk, preset.peak_frac_for_non_silent)
+	too_noise = (
+		rms_chunk < preset.min_signal_rms
+		or peak_chunk < preset.min_signal_peak
+		or ns_ratio + 1e-9 < preset.min_non_silent_ratio
+		or harms_rms_chunk + 1e-15 < preset.min_hpss_harmonic_rms
+	)
+
+	if too_noise:
+		TOO_QUIET_STREAK += 1
+		WEAK_PENDING_LABEL = ""
+		WEAK_PENDING_STREAK = 0
+		if TOO_QUIET_STREAK >= preset.too_quiet_streak_clear:
+			LAST_VALID_CHORD = ""
+			NO_ACCEPT_STREAK = 0
+			_clear_recent_accepted_chords()
+		clear_display = TOO_QUIET_STREAK >= preset.too_quiet_streak_clear
+		chord_out = "N"
+		key_label, key_confidence = _fallback_key()
+		return {
+			"chord": chord_out,
+			"confidence": 0.0,
+			"key": key_label,
+			"key_confidence": float(key_confidence),
+			"timestamp": time.time(),
+			"debug": _stream_response_debug(
+				preset,
+				raw_mapped="N",
+				final_chord=chord_out,
+				rejection_reason_canon=canon_stream_rejection("too_quiet"),
+				accepted=False,
+				clear_display=clear_display,
+				key_updated_this_chunk=False,
+				scores_top3=[],
+				rms_chunk=rms_chunk,
+				peak_chunk=peak_chunk,
+				harmonic_hpss_rms=harms_rms_chunk,
+				non_silent_ratio=ns_ratio,
+				best_score=0.0,
+				second_score=0.0,
+				confidence=0.0,
+				entropy=0.0,
+				stability=0.0,
+				strong_bins=0,
+				silence=False,
+				key_display_source="fallback_last_valid",
+				instant_key_raw=None,
+				instant_key_confidence=None,
+				mode_fields=mode_fields,
+				chord_commit_kind="too_quiet",
+				displayed_chord=chord_out,
+			),
+		}
+
+	TOO_QUIET_STREAK = 0
 
 	try:
 		chroma = extract_chroma_cqt(y, sr, use_hpss=True)
@@ -710,6 +825,7 @@ async def stream_audio(
 
 	gate = _gates_harmonic(
 		preset,
+		harmonic_hpss_rms=harms_rms_chunk,
 		peak_chunk=peak_chunk,
 		rms_chunk=rms_chunk,
 		entropy=entropy,
@@ -724,14 +840,13 @@ async def stream_audio(
 		WEAK_PENDING_STREAK = 0
 		NO_ACCEPT_STREAK += 1
 		commit_gate = "gate_reject"
+		chord_out = "N"
 		if NO_ACCEPT_STREAK >= preset.invalid_streak_clear_display:
 			LAST_VALID_CHORD = ""
 			_clear_recent_accepted_chords()
-			chord_out = "N"
 			clear_display = True
 			commit_gate = "cleared_invalid_streak"
 		else:
-			chord_out = LAST_VALID_CHORD if LAST_VALID_CHORD else "N"
 			clear_display = False
 		key_label, key_confidence = _fallback_key()
 		return {
@@ -744,12 +859,15 @@ async def stream_audio(
 				preset,
 				raw_mapped=raw_mapped,
 				final_chord=chord_out,
-				rejection_reason=gate,
+				rejection_reason_canon=canon_stream_rejection(gate),
 				accepted=False,
 				clear_display=clear_display,
+				key_updated_this_chunk=False,
 				scores_top3=top3,
 				rms_chunk=rms_chunk,
 				peak_chunk=peak_chunk,
+				harmonic_hpss_rms=harms_rms_chunk,
+				non_silent_ratio=ns_ratio,
 				best_score=best_score,
 				second_score=second_score,
 				confidence=float(confidence),
@@ -774,7 +892,7 @@ async def stream_audio(
 		strong_bins=strong_bins,
 	)
 	accepted = False
-	rejection_reason = "accepted"
+	rejection_raw = "accepted"
 	commit_kind = "hold_pending_weak"
 
 	if is_immediate:
@@ -794,7 +912,7 @@ async def stream_audio(
 			WEAK_PENDING_LABEL = ""
 			WEAK_PENDING_STREAK = 0
 		else:
-			rejection_reason = "pending_weak_confirm"
+			rejection_raw = "pending_weak_confirm"
 
 	if accepted:
 		NO_ACCEPT_STREAK = 0
@@ -813,12 +931,15 @@ async def stream_audio(
 				preset,
 				raw_mapped=raw_mapped,
 				final_chord=raw_mapped,
-				rejection_reason="accepted",
+				rejection_reason_canon=canon_stream_rejection("accepted"),
 				accepted=True,
 				clear_display=False,
+				key_updated_this_chunk=True,
 				scores_top3=top3,
 				rms_chunk=rms_chunk,
 				peak_chunk=peak_chunk,
+				harmonic_hpss_rms=harms_rms_chunk,
+				non_silent_ratio=ns_ratio,
 				best_score=best_score,
 				second_score=second_score,
 				confidence=float(confidence),
@@ -835,7 +956,7 @@ async def stream_audio(
 			),
 		}
 
-	# pending weak: hold previous chord / Listening..., no history spam
+	# Pending weak confirmation: smoother UX—show last-valid triad hint while accumulating evidence.
 	NO_ACCEPT_STREAK = 0
 	chord_out = LAST_VALID_CHORD if LAST_VALID_CHORD else "N"
 	key_label, key_confidence = _fallback_key()
@@ -849,12 +970,15 @@ async def stream_audio(
 			preset,
 			raw_mapped=raw_mapped,
 			final_chord=chord_out,
-			rejection_reason=rejection_reason,
+			rejection_reason_canon=canon_stream_rejection(rejection_raw),
 			accepted=False,
 			clear_display=False,
+			key_updated_this_chunk=False,
 			scores_top3=top3,
 			rms_chunk=rms_chunk,
 			peak_chunk=peak_chunk,
+			harmonic_hpss_rms=harms_rms_chunk,
+			non_silent_ratio=ns_ratio,
 			best_score=best_score,
 			second_score=second_score,
 			confidence=float(confidence),
