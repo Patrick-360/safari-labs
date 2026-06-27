@@ -825,39 +825,193 @@ def _core_label_stats(chords: List[Dict[str, Any]]) -> Dict[str, Dict[str, float
 	return stats
 
 
-def _annotate_core_eligibility_inplace(c: Dict[str, Any], stats: Dict[str, Dict[str, float]]) -> None:
-	"""Frontend may omit these segments when building the main progression (additive field)."""
+def _annotate_core_eligibility_inplace(
+	c: Dict[str, Any],
+	stats: Dict[str, Dict[str, float]],
+	*,
+	low_conf_threshold: float = 0.16,
+) -> None:
+	"""Frontend may omit these segments when building the main progression (additive field).
+
+	`low_conf_threshold` is calibrated per preset: Theory's 7th templates lower confidence
+	scores so the threshold is lowered to avoid marking all Theory segments as non-core.
+	The raw chord timeline (analyzeResult.chords) is unaffected — only core progression uses this.
+	"""
 	_ = stats
 	dur = float(c["end"]) - float(c["start"])
 	vox = bool(c.get("vocal_interference"))
 	c["exclude_from_core"] = bool(
 		c.get("low_confidence")
 		or c.get("is_passing")
-		or float(c.get("confidence", 0.0)) < 0.16
+		or float(c.get("confidence", 0.0)) < low_conf_threshold
 		or (vox and dur < 0.55)
 	)
 
 
-def _annotate_core_eligibility_all(chords: List[Dict[str, Any]]) -> None:
+def _annotate_core_eligibility_all(
+	chords: List[Dict[str, Any]],
+	*,
+	low_conf_threshold: float = 0.16,
+) -> None:
 	stats = _core_label_stats(chords)
 	for c in chords:
-		_annotate_core_eligibility_inplace(c, stats)
+		_annotate_core_eligibility_inplace(c, stats, low_conf_threshold=low_conf_threshold)
 
 
-def _filtering_debug_stats(chords: List[Dict[str, Any]]) -> Dict[str, Any]:
-	labels = [str(c.get("label", "N")) for c in chords if str(c.get("label", "N")) != "N"]
-	core = [c for c in chords if not c.get("exclude_from_core")]
+def _apply_long_segment_guardrail(
+	chords: List[Dict[str, Any]],
+	chords_pre_refine: List[Dict[str, Any]],
+	*,
+	max_sec: float,
+	min_split_sec: float = 2.5,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+	"""
+	Safety-net after refine_chord_timeline: split any segment longer than max_sec.
+
+	Uses pre-refine segments (output of chord_timeline_sliding, before snap/collapse) as
+	split boundaries.  Only splits where a pre-refine segment has a *different* label AND
+	enough duration to avoid re-creating tiny fragments (>= min_split_sec).
+
+	Returns: (new_chords, guardrail_applied_count, split_count).
+	"""
+	if max_sec <= 0 or not chords_pre_refine:
+		return chords, 0, 0
+
+	out: List[Dict[str, Any]] = []
+	applied = 0
+	split_count = 0
+
+	for seg in chords:
+		dur = float(seg["end"]) - float(seg["start"])
+		if dur <= max_sec:
+			out.append(seg)
+			continue
+
+		t_start = float(seg["start"])
+		t_end = float(seg["end"])
+		seg_label = str(seg.get("label", "N"))
+
+		# Find pre-refine sub-segments with a different label and minimum duration.
+		candidates = sorted(
+			[
+				c for c in chords_pre_refine
+				if (
+					float(c["end"]) > t_start + 0.05
+					and float(c["start"]) < t_end - 0.05
+					and str(c.get("label", "N")) != seg_label
+					and str(c.get("label", "N")) != "N"
+					and float(c["end"]) - float(c["start"]) >= min_split_sec
+				)
+			],
+			key=lambda c: float(c["start"]),
+		)
+
+		if not candidates:
+			out.append(seg)
+			continue
+
+		applied += 1
+		cursor = t_start
+		pieces: List[Dict[str, Any]] = []
+
+		for c in candidates:
+			c_start = max(float(c["start"]), t_start)
+			c_end = min(float(c["end"]), t_end)
+			# Gap before candidate → original chord piece
+			if c_start - cursor >= min_split_sec:
+				piece = dict(seg)
+				piece["start"] = round(cursor, 4)
+				piece["end"] = round(c_start, 4)
+				pieces.append(piece)
+			# Candidate piece
+			if c_end - c_start >= min_split_sec:
+				piece_c = dict(c)
+				piece_c["start"] = round(c_start, 4)
+				piece_c["end"] = round(c_end, 4)
+				pieces.append(piece_c)
+				split_count += 1
+			cursor = max(cursor, c_end)
+
+		# Trailing original chord piece
+		if t_end - cursor >= min_split_sec:
+			piece = dict(seg)
+			piece["start"] = round(cursor, 4)
+			piece["end"] = round(t_end, 4)
+			pieces.append(piece)
+
+		out.extend(pieces if pieces else [seg])
+
+	return _merge_adjacent_chord_labels(out), applied, split_count
+
+
+def _simulate_core_fallback(chords_final: List[Dict[str, Any]]) -> Tuple[bool, str | None]:
+	"""Simulate the frontend tiered fallback to report which tier would activate."""
+	non_n = [c for c in chords_final if str(c.get("label", "N")) != "N"]
+	if not non_n:
+		return True, "empty_timeline"
+	strict = [
+		c for c in non_n
+		if not c.get("exclude_from_core") and not c.get("is_passing") and not c.get("low_confidence")
+	]
+	if len(set(c.get("label") for c in strict)) >= 2:
+		return False, None
+	medium = [c for c in non_n if not c.get("is_passing")]
+	if len(set(c.get("label") for c in medium)) >= 2:
+		return True, "fallback_medium_non_passing"
+	if len(set(c.get("label") for c in non_n)) >= 2:
+		return True, "fallback_all_non_n"
+	return True, "fallback_sparse_timeline"
+
+
+def _filtering_debug_stats(
+	chords_pre_refine: List[Dict[str, Any]],
+	chords_final: List[Dict[str, Any]],
+	raw_frame_count: int = 0,
+	*,
+	guardrail_applied: int = 0,
+	guardrail_splits: int = 0,
+	longest_before_guardrail: float = 0.0,
+	longest_after_guardrail: float = 0.0,
+	post_sticky_segment_count: int = 0,
+	post_median_segment_count: int = 0,
+) -> Dict[str, Any]:
+	pre_labels = [str(c.get("label", "N")) for c in chords_pre_refine if str(c.get("label", "N")) != "N"]
+	labels = [str(c.get("label", "N")) for c in chords_final if str(c.get("label", "N")) != "N"]
+	core = [c for c in chords_final if not c.get("exclude_from_core")]
 	core_labels = [str(c.get("label", "N")) for c in core if str(c.get("label", "N")) != "N"]
+
+	# Longest segment stats
+	longest_dur = 0.0
+	longest_label = ""
+	for c in chords_final:
+		dur = float(c.get("end", 0)) - float(c.get("start", 0))
+		if dur > longest_dur:
+			longest_dur = dur
+			longest_label = str(c.get("label", "N"))
+
+	fallback_used, fallback_reason = _simulate_core_fallback(chords_final)
 	return {
-		"raw_chord_segment_count": len(chords),
-		"returned_chord_segment_count": len(chords),
-		"core_candidate_count_before_filter": len(chords),
+		"raw_chord_frame_count": raw_frame_count,
+		"raw_chord_segment_count": len(chords_pre_refine),
+		"post_sticky_segment_count": post_sticky_segment_count,
+		"post_median_segment_count": post_median_segment_count,
+		"returned_chord_segment_count": len(chords_final),
+		"unique_raw_chords": len(set(pre_labels)),
+		"unique_returned_chords": len(set(labels)),
+		"core_candidate_count_before_filter": len(chords_final),
 		"core_candidate_count_after_filter": len(core),
-		"unique_raw_chords": len(set(labels)),
 		"unique_core_chords": len(set(core_labels)),
-		"excluded_from_core_count": sum(1 for c in chords if c.get("exclude_from_core")),
-		"low_confidence_count": sum(1 for c in chords if c.get("low_confidence")),
-		"vocal_interference_count": sum(1 for c in chords if c.get("vocal_interference")),
+		"excluded_from_core_count": sum(1 for c in chords_final if c.get("exclude_from_core")),
+		"low_confidence_count": sum(1 for c in chords_final if c.get("low_confidence")),
+		"vocal_interference_count": sum(1 for c in chords_final if c.get("vocal_interference")),
+		"longest_segment_label": longest_label,
+		"longest_segment_duration": round(longest_dur, 3),
+		"longest_segment_before_guardrail": round(longest_before_guardrail, 3),
+		"longest_segment_after_guardrail": round(longest_after_guardrail, 3),
+		"final_long_segment_guardrail_applied_count": guardrail_applied,
+		"final_long_segment_split_count": guardrail_splits,
+		"core_progression_fallback_used": fallback_used,
+		"core_progression_fallback_reason": fallback_reason,
 	}
 
 
@@ -982,10 +1136,15 @@ def _snap_weak_chord_blips_to_prev(
 	chords: List[Dict[str, Any]],
 	chroma: np.ndarray,
 	sr: int,
+	*,
+	snap_conf_threshold: float = SNAP_EXTRA_CONF_THRESHOLD,
 ) -> List[Dict[str, Any]]:
 	"""
 	If a short segment is low-confidence or very weakly scored but its chroma is very similar to the
 	previous chord pocket, keep the prior chord (melody / passing tone — no source separation).
+
+	`snap_conf_threshold` is calibrated per preset: Theory uses a lower value because 7th-chord
+	template competition reduces confidence scores even for correct detections.
 	"""
 	if len(chords) < 2:
 		return chords
@@ -997,7 +1156,7 @@ def _snap_weak_chord_blips_to_prev(
 			continue
 		weak = bool(
 			work[i].get("low_confidence", False)
-			or float(work[i].get("confidence", 1.0)) < SNAP_EXTRA_CONF_THRESHOLD
+			or float(work[i].get("confidence", 1.0)) < snap_conf_threshold
 		)
 		if not weak:
 			continue
@@ -1172,10 +1331,14 @@ def _annotate_passing_chords(chords: List[Dict[str, Any]]) -> List[Dict[str, Any
 	return out
 
 
-def _finalize_chord_confidence_flags(chords: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _finalize_chord_confidence_flags(
+	chords: List[Dict[str, Any]],
+	*,
+	low_conf_cutoff: float = CHORD_LOW_CONF_CUTOFF,
+) -> List[Dict[str, Any]]:
 	for c in chords:
 		cf = float(c.get("confidence", 0.5))
-		low = bool(c.get("low_confidence", False) or cf < CHORD_LOW_CONF_CUTOFF)
+		low = bool(c.get("low_confidence", False) or cf < low_conf_cutoff)
 		c["low_confidence"] = low
 		c["confidence"] = round(cf, 4)
 		c.setdefault("is_passing", False)
@@ -1200,14 +1363,21 @@ def refine_chord_timeline(
 	*,
 	beat_times: List[float] | None = None,
 	duration_sec: float | None = None,
+	snap_conf_threshold: float = SNAP_EXTRA_CONF_THRESHOLD,
+	low_conf_cutoff: float = CHORD_LOW_CONF_CUTOFF,
 ) -> List[Dict[str, Any]]:
-	"""Post-pass: spikes, fragments, chroma-merge, harmonic boundary nudge, passing tags."""
+	"""Post-pass: spikes, fragments, chroma-merge, harmonic boundary nudge, passing tags.
+
+	`snap_conf_threshold` and `low_conf_cutoff` are calibrated per preset so that Theory's
+	smaller confidence scores (caused by 7th-chord template competition) do not over-filter
+	the raw chord timeline.
+	"""
 	if not chords:
 		return []
 	dur = float(duration_sec) if duration_sec is not None else float(chords[-1]["end"])
 	min_frag = max(MIN_CHORD_SEGMENT_SEC, MIN_STABLE_REGION_SEC)
 	x = _remove_chord_spikes(chords)
-	x = _snap_weak_chord_blips_to_prev(x, chroma, sr)
+	x = _snap_weak_chord_blips_to_prev(x, chroma, sr, snap_conf_threshold=snap_conf_threshold)
 	x = _merge_chroma_similar_neighbors(x, chroma, sr)
 	x = _collapse_short_chord_segments(x, min_frag)
 	x = _merge_adjacent_chord_labels(x)
@@ -1216,7 +1386,7 @@ def refine_chord_timeline(
 	x = _collapse_short_chord_segments(x, min_frag)
 	x = _merge_adjacent_chord_labels(x)
 	x = _annotate_passing_chords(x)
-	return _finalize_chord_confidence_flags(x)
+	return _finalize_chord_confidence_flags(x, low_conf_cutoff=low_conf_cutoff)
 
 
 def _section_chroma_vector(chroma: np.ndarray, sr: int, t0: float, t1: float, duration_sec: float) -> np.ndarray:
@@ -1575,20 +1745,54 @@ def _sticky_post_median_slots(
 	lows: List[bool],
 	vocal_slots: List[bool] | None = None,
 	vocal_sticky_mult: float = VOCAL_STICKY_MARGIN_MULT,
+	min_raw_margin: float = STICKY_MIN_RAW_MARGIN,
+	max_hold_slots: int = 0,
+	forced_window_slots: int = 0,
 ) -> Tuple[List[str], List[float], List[bool]]:
 	"""
 	When a *change* is weakly supported vs the runner-up template, hold the previous chord.
 	Approximates hysteresis so brief vocal chroma peaks flip harmony less often.
+
+	`min_raw_margin` defaults to the global STICKY_MIN_RAW_MARGIN but can be overridden
+	per-preset; Theory's 7th templates reduce margins, requiring a lower floor.
+
+	`max_hold_slots` caps how many consecutive slots the gate may hold one chord before
+	forcing a release — prevents a single chord from occupying a whole song when all frames
+	have margins below the floor (common with 109-template Theory mode).  0 = unlimited.
+
+	`forced_window_slots` sets how many slots to emit the forced chord after cap fires.
+	Using a majority-vote look-ahead, this produces a segment long enough to survive the
+	refine pipeline's snap/collapse steps (SNAP_WEAK_MAX_SEC=0.5s, min_frag=0.2s).
+	A single-slot release (forced_window_slots=0) would be absorbed by those steps.
 	"""
 	if not labels:
 		return labels, confs, lows
 	out_labels = [labels[0]]
 	out_confs = [confs[0]]
 	out_lows = [lows[0]]
+	hold_count = 0
+	# Track consecutive slots where the CURRENT output label has been emitted (output age).
+	# This is what the cap should be based on: wall-time held, not just rejected challenges.
+	# (hold_count alone resets every time cand==prev, so a dominant chord is never capped.)
+	current_label_age = 1
+	forced_remaining = 0
+	forced_label = ""
 	for i in range(1, len(labels)):
+		# --- Forced release window: emit the chosen chord without sticky ---
+		if forced_remaining > 0:
+			forced_remaining -= 1
+			current_label_age += 1
+			hold_count = 0
+			out_labels.append(forced_label)
+			out_confs.append(confs[i])
+			out_lows.append(lows[i])
+			continue
+
 		cand = labels[i]
 		prev = out_labels[-1]
 		if cand == prev:
+			hold_count = 0
+			current_label_age += 1
 			out_labels.append(cand)
 			out_confs.append(confs[i])
 			out_lows.append(lows[i])
@@ -1596,12 +1800,42 @@ def _sticky_post_median_slots(
 		bs = best_scores[i]
 		raw_m = bs - second_scores[i]
 		mult = vocal_sticky_mult if vocal_slots and vocal_slots[i] else 1.0
-		weak = bs < STICKY_MIN_BEST_SCORE or raw_m < STICKY_MIN_RAW_MARGIN * mult
+		weak = bs < STICKY_MIN_BEST_SCORE or raw_m < min_raw_margin * mult
+
+		# Cap: the current output label has been emitted for too many consecutive slots.
+		# Use current_label_age (output wall-time) so a dominant chord cannot hold forever
+		# even when it is re-detected naturally on same-label slots (which reset hold_count).
+		if weak and max_hold_slots > 0 and current_label_age >= max_hold_slots:
+			if forced_window_slots > 0:
+				# Majority-vote on next forced_window_slots labels to pick best non-prev chord.
+				look_end = min(len(labels), i + forced_window_slots)
+				future = labels[i:look_end]
+				non_prev = [l for l in future if l != prev and l != "N"]
+				# Only force if at least 10 % of the window wants something different;
+				# avoids injecting a phantom chord into a genuinely mono-chord passage.
+				min_votes = max(1, int(forced_window_slots * 0.10))
+				if len(non_prev) >= min_votes:
+					ctr = Counter(non_prev)
+					forced_label = ctr.most_common(1)[0][0]
+					forced_remaining = forced_window_slots - 1
+					hold_count = 0
+					current_label_age = 1
+					out_labels.append(forced_label)
+					out_confs.append(confs[i])
+					out_lows.append(lows[i])
+					continue
+			# Fallback: single-slot release (no window or not enough evidence).
+			weak = False
+
 		if weak:
+			hold_count += 1
+			current_label_age += 1
 			out_labels.append(prev)
 			out_confs.append(min(float(confs[i]), STICKY_CONF_CAP))
 			out_lows.append(True)
 		else:
+			hold_count = 0
+			current_label_age = 1
 			out_labels.append(cand)
 			out_confs.append(confs[i])
 			out_lows.append(lows[i])
@@ -1695,7 +1929,7 @@ def chord_timeline_sliding(
 			prev_internal = _internal
 		slot_labels.append(label)
 		slot_conf.append(float(conf))
-		slot_low.append(bool(conf < CHORD_LOW_CONF_CUTOFF or label == "N"))
+		slot_low.append(bool(conf < chord_preset.low_conf_cutoff or label == "N"))
 		slot_best.append(float(_bs))
 		slot_second.append(float(_ss))
 		slot_vocal.append(bool(vocal))
@@ -1704,6 +1938,18 @@ def chord_timeline_sliding(
 	med_w = CHORD_LABEL_MEDIAN_SLOTS
 	filtered = _median_chord_labels(slot_labels, med_w)
 	sticky_vocal = _median_bool_flags(slot_vocal, med_w)
+	# Convert time-based sticky parameters to slot counts for this audio's hop size.
+	_slot_sec = float(HOP_LENGTH * hop) / float(sr) if hop > 0 else 1.0
+	_max_hold_slots = (
+		max(1, int(chord_preset.max_sticky_hold_sec / _slot_sec))
+		if chord_preset.max_sticky_hold_sec > 0.0
+		else 0
+	)
+	_forced_window_slots = (
+		max(1, int(chord_preset.sticky_forced_window_sec / _slot_sec))
+		if chord_preset.sticky_forced_window_sec > 0.0
+		else 0
+	)
 	stable_l, stable_c, stable_lo = _sticky_post_median_slots(
 		filtered,
 		slot_best,
@@ -1712,11 +1958,11 @@ def chord_timeline_sliding(
 		slot_low,
 		vocal_slots=sticky_vocal,
 		vocal_sticky_mult=chord_preset.vocal_sticky_margin_mult,
+		min_raw_margin=chord_preset.sticky_min_raw_margin,
+		max_hold_slots=_max_hold_slots,
+		forced_window_slots=_forced_window_slots,
 	)
 	_apply_nearby_label_stability(stable_c, stable_l)
-	for k in range(len(stable_lo)):
-		if stable_c[k] < CHORD_LOW_CONF_CUTOFF:
-			stable_lo[k] = True
 
 	duration_sec = float(t_frames * HOP_LENGTH) / float(sr)
 
@@ -1743,7 +1989,8 @@ def chord_timeline_sliding(
 			end_f = min(t_frames, start_f + 1)
 		label = stable_l[ra]
 		conf = float(max(stable_c[ra:rb]))
-		low = any(stable_lo[ra:rb]) or label == "N"
+		# Use max aggregate confidence (not any-slot) so sticky-held slots don't poison the flag.
+		low = (conf < chord_preset.low_conf_cutoff) or label == "N"
 		t_sc = round(float(max(slot_best[ra:rb])), 4)
 		br = range(ra, rb)
 		t_mg = round(float(max(float(slot_best[i]) - float(slot_second[i]) for i in br)), 4)
@@ -2275,9 +2522,32 @@ def run_analysis(
 			key_raw=key_raw,
 			chord_preset=chord_preset,
 		)
-	chords_pre_snapshot = [dict(c) for c in chords] if debug else []
-	chords = refine_chord_timeline(chords, chroma, sr, beat_times=beat_times, duration_sec=duration_sec)
-	_annotate_core_eligibility_all(chords)
+	need_pre_snapshot = debug or chord_preset.max_returned_segment_sec > 0
+	chords_pre_snapshot = [dict(c) for c in chords] if need_pre_snapshot else []
+	chords = refine_chord_timeline(
+		chords,
+		chroma,
+		sr,
+		beat_times=beat_times,
+		duration_sec=duration_sec,
+		snap_conf_threshold=chord_preset.snap_conf_threshold,
+		low_conf_cutoff=chord_preset.low_conf_cutoff,
+	)
+	longest_before_guardrail = max(
+		(float(c["end"]) - float(c["start"]) for c in chords), default=0.0
+	)
+	guardrail_applied = guardrail_splits = 0
+	if chord_preset.max_returned_segment_sec > 0 and chords_pre_snapshot:
+		chords, guardrail_applied, guardrail_splits = _apply_long_segment_guardrail(
+			chords,
+			chords_pre_snapshot,
+			max_sec=chord_preset.max_returned_segment_sec,
+			min_split_sec=2.5,
+		)
+	longest_after_guardrail = max(
+		(float(c["end"]) - float(c["start"]) for c in chords), default=0.0
+	)
+	_annotate_core_eligibility_all(chords, low_conf_threshold=chord_preset.low_conf_cutoff)
 	chords = [_enrich_chord_segment(c) for c in chords]
 
 	beats_payload = [{"time": t} for t in beat_times]
@@ -2346,7 +2616,27 @@ def run_analysis(
 		dbg["normalized_tempo_bpm"] = tempo_meta["normalized_tempo_bpm"]
 		dbg["tempo_reason"] = tempo_meta["tempo_reason"]
 		dbg["tempo_candidates"] = tempo_meta.get("tempo_candidates", [])
-		dbg.update(_filtering_debug_stats(chords))
+		# Compute post-sticky and post-median run counts from slot granular data.
+		_sticky_labels = (slot_granular or {}).get("labels_after_sticky", [])
+		_median_labels = (slot_granular or {}).get("labels_after_median", [])
+		def _count_runs(seq: list) -> int:
+			n = 0
+			prev: str | None = None
+			for l in seq:
+				if l != prev:
+					n += 1
+					prev = l
+			return n
+		dbg.update(_filtering_debug_stats(
+			chords_pre_snapshot, chords,
+			raw_frame_count=int(chroma.shape[1]),
+			guardrail_applied=guardrail_applied,
+			guardrail_splits=guardrail_splits,
+			longest_before_guardrail=longest_before_guardrail,
+			longest_after_guardrail=longest_after_guardrail,
+			post_sticky_segment_count=_count_runs(_sticky_labels),
+			post_median_segment_count=_count_runs(_median_labels),
+		))
 		dbg["segments_pre_refine_count"] = len(chords_pre_snapshot)
 		dbg["chord_quality_summary"] = _chord_quality_summary(chords)
 		payload["debug"] = dbg
