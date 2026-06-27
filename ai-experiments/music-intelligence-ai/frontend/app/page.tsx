@@ -438,6 +438,14 @@ type AnalyzeChordSeg = {
 
 type AnalyzeChordEngineId = "stable" | "theory" | "experimental";
 
+type SimplePracticeChord = {
+  label: string;
+  source_labels: string[];
+  total_duration: number;
+  count: number;
+  reason?: string | null;
+};
+
 type AnalyzeApiResponse = {
   duration: number;
   tempo: number;
@@ -447,6 +455,7 @@ type AnalyzeApiResponse = {
   beats: { time: number }[];
   sections: { index: number; start: number; end: number; label: string; repeat_group?: string | null }[];
   rhythm?: AnalyzeRhythm;
+  simple_practice_progression?: SimplePracticeChord[];
   debug?: Record<string, unknown>;
 };
 
@@ -822,6 +831,30 @@ function readStrengthLabel(value: number): string {
   return "Light";
 }
 
+/** Map raw error strings from the analyze fetch to user-friendly messages. */
+function friendlyAnalyzeError(raw: string): string {
+  const r = raw.toLowerCase();
+  if (r.includes("failed to fetch") || r.includes("networkerror") || r.includes("network request failed") || r.includes("load failed")) {
+    return "Could not reach the analysis server. Check that the backend is running and try again.";
+  }
+  if (r.includes("413") || r.includes("too large") || r.includes("payload too large")) {
+    return "This file is too large to upload. Try a shorter clip — 3 to 5 minutes works best.";
+  }
+  if (r.includes("empty") || r.includes("too short")) {
+    return "The file appears empty or too short. Try a recording with at least a few seconds of audio.";
+  }
+  if (r.includes("invalid_audio") || r.includes("unsupported") || r.includes("not contain")) {
+    return "This file doesn’t contain usable audio. Try a WAV or MP3 file with clear piano or guitar.";
+  }
+  if (r.includes("analyze_failed") || r.includes("400")) {
+    return "Analysis did not complete. Try a clearer recording — piano, guitar, or simple arrangements work best.";
+  }
+  if (r.includes("500") || r.includes("server error") || r.includes("schema_mismatch")) {
+    return "The server encountered an error. Try again, or try a different file.";
+  }
+  return "Analysis failed. Try a clearer recording with piano or guitar, or a shorter clip.";
+}
+
 /** Illustrative stages while POST /analyze runs — not timed to real server progress. */
 const ANALYZE_STAGE_MESSAGES = [
   {
@@ -959,7 +992,7 @@ function TransposeDisplayControl(props: { id: string; value: number; onChange: (
 }
 
 export default function Home() {
-  const [appMode, setAppMode] = useState<"live" | "file">("live");
+  const [appMode, setAppMode] = useState<"live" | "file">("file");
   /** Practice display: concert pitch vs written transposition; Analyze + Live transcription share this. */
   const [displayTransposeSemitones, setDisplayTransposeSemitones] = useState(0);
 
@@ -1273,6 +1306,20 @@ export default function Home() {
       notesLine: chordNotesDisplayForLabel(transposeChordLabel(e.label, n)),
     }));
   }, [coreProgression, displayTransposeSemitones]);
+
+  const simplePracticeProgression = useMemo(
+    () => analyzeResult?.simple_practice_progression ?? [],
+    [analyzeResult?.simple_practice_progression],
+  );
+
+  const simplePracticeProgressionDisplay = useMemo(() => {
+    const n = displayTransposeSemitones;
+    if (n === 0) return simplePracticeProgression;
+    return simplePracticeProgression.map((e) => ({
+      ...e,
+      label: transposeChordLabel(e.label, n),
+    }));
+  }, [simplePracticeProgression, displayTransposeSemitones]);
 
   const currentChordLabelForHighlight = useMemo(() => {
     if (!analyzeResult) return "";
@@ -2744,18 +2791,12 @@ export default function Home() {
   return (
     <main className={`demo${appMode === "file" ? " demo--file" : ""}`}>
       <header className="hero">
-        <h1>Chord lab</h1>
-        <p className="hero-sub">Learn from a recording, or listen in with the mic</p>
+        <h1>Upload a song. Get a practice roadmap.</h1>
+        <p className="hero-sub">
+          AI-assisted chords, key, tempo, simple practice progression, loopable sections, and speed control.
+        </p>
+        <p className="hero-beta">Beta — practice guidance, not perfect transcription.</p>
         <div className="mode-toggle mode-toggle--primary" role="tablist" aria-label="App mode">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={appMode === "live"}
-            className={appMode === "live" ? "active" : ""}
-            onClick={() => setAppMode("live")}
-          >
-            Listen live
-          </button>
           <button
             type="button"
             role="tab"
@@ -2763,18 +2804,30 @@ export default function Home() {
             className={appMode === "file" ? "active" : ""}
             onClick={() => setAppMode("file")}
           >
-            Learn from audio
+            Analyze File
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={appMode === "live"}
+            className={appMode === "live" ? "active" : ""}
+            onClick={() => setAppMode("live")}
+          >
+            Live mic (experimental)
           </button>
         </div>
         <p className="mode-intro" role="note">
           {appMode === "file"
-            ? "Best for a full song: upload a take to get the clearest chart, main progression, practice parts, and loops."
-            : "Quick checks and rough sketches from the mic. For the most accurate chart of a recording, use Learn from audio."}
+            ? "Upload a recording for your practice roadmap — simple chord progression, key, tempo, loopable sections, and piano basics."
+            : "Experimental: rough chord sketches from the microphone. For a full practice roadmap, use Analyze File."}
         </p>
       </header>
 
       {appMode === "live" ? (
         <>
+          <div className="live-experimental-banner" role="note">
+            <strong>Experimental</strong> — live mic results are rougher than file analysis. For the best chord roadmap, use <button type="button" className="live-switch-to-file-link" onClick={() => setAppMode("file")}>Analyze File</button>.
+          </div>
           <div className="mode-toggle live-experience-toggle" role="tablist" aria-label="Live listening mode">
             <button
               type="button"
@@ -3441,10 +3494,12 @@ export default function Home() {
       ) : (
         <section className="analyze-panel" aria-label="File analysis">
           <header className="analyze-panel-header">
-            <h2>Learn from audio</h2>
+            <h2>Analyze File</h2>
             <p className="analyze-lead">
-              Upload a recording for the best chord chart. Follow the main progression, then loop sections and slow the tempo
-              until it feels easy.
+              Upload a song and get a practice roadmap — simple chord progression, key, tempo, loopable sections, speed control, and piano basics.
+            </p>
+            <p className="analyze-limitations-note">
+              Works best with clear audio, piano, guitar, and simple progressions. Results are AI-assisted — check by ear. Live modes are experimental.
             </p>
           </header>
 
@@ -3460,55 +3515,59 @@ export default function Home() {
             </label>
             <button
               type="button"
-              className="analyze-run-btn"
+              className={`analyze-run-btn${analyzeLoading ? " analyze-run-btn--busy" : ""}${!analyzeFile && !analyzeLoading ? " analyze-run-btn--waiting" : ""}`}
               onClick={() => void runAnalyze()}
               disabled={!analyzeFile || analyzeLoading}
+              aria-busy={analyzeLoading}
             >
-              {analyzeLoading ? "Working…" : "Analyze"}
+              {analyzeLoading ? "Analyzing…" : analyzeFile ? "Analyze" : "Choose a file first"}
             </button>
-            <label className="muted-hint analyze-debug-api-label">
-              <input
-                type="checkbox"
-                checked={analyzeQueryDebug}
-                onChange={(e) => setAnalyzeQueryDebug(e.target.checked)}
-              />{" "}
-              Include <code>debug</code> in API response
-            </label>
           </div>
 
-          <div className="analyze-sep-advanced">
-            <div className="analyze-loop-row analyze-chord-engine-row">
-              <label htmlFor="analyze-chord-engine" className="muted-hint analyze-chord-engine-label">
-                Chord engine
+          <details className="analyze-advanced-drawer">
+            <summary className="analyze-advanced-summary">Advanced settings</summary>
+            <div className="analyze-sep-advanced">
+              <div className="analyze-loop-row analyze-chord-engine-row">
+                <label htmlFor="analyze-chord-engine" className="muted-hint analyze-chord-engine-label">
+                  Chord engine
+                </label>
+                <select
+                  id="analyze-chord-engine"
+                  value={analyzeChordEngine}
+                  onChange={(e) =>
+                    setAnalyzeChordEngine(normalizeChordEngineFromApi(e.target.value))
+                  }
+                >
+                  <option value="stable">Stable</option>
+                  <option value="theory">Theory enhanced</option>
+                  <option value="experimental">Experimental (noisier)</option>
+                </select>
+              </div>
+              <p className="muted-hint analyze-sep-hint analyze-chord-engine-hint">
+                Stable is best for simple songs. Theory enhanced (default) handles vocals, 7ths, and R&amp;B harmony
+                more carefully. Experimental may be noisier — use for A/B tests only.
+              </p>
+              <label className="muted-hint analyze-debug-api-label">
+                <input
+                  type="checkbox"
+                  checked={analyzeUseSourceSeparation}
+                  onChange={(e) => setAnalyzeUseSourceSeparation(e.target.checked)}
+                />{" "}
+                Try vocal/drum separation for better chords
               </label>
-              <select
-                id="analyze-chord-engine"
-                value={analyzeChordEngine}
-                onChange={(e) =>
-                  setAnalyzeChordEngine(normalizeChordEngineFromApi(e.target.value))
-                }
-              >
-                <option value="stable">Stable</option>
-                <option value="theory">Theory enhanced</option>
-                <option value="experimental">Experimental (noisier)</option>
-              </select>
+              <p className="muted-hint analyze-sep-hint">
+                Slower, experimental, best for songs with vocals. Falls back safely if the separator isn&apos;t installed.
+              </p>
+              <label className="muted-hint analyze-debug-api-label">
+                <input
+                  type="checkbox"
+                  checked={analyzeQueryDebug}
+                  onChange={(e) => setAnalyzeQueryDebug(e.target.checked)}
+                />{" "}
+                Include <code>debug</code> fields in API response
+              </label>
             </div>
-            <p className="muted-hint analyze-sep-hint analyze-chord-engine-hint">
-              Stable is best for simple songs. Theory enhanced (default) handles vocals, 7ths, and R&amp;B harmony
-              more carefully. Experimental may be noisier — use for A/B tests only.
-            </p>
-            <label className="muted-hint analyze-debug-api-label">
-              <input
-                type="checkbox"
-                checked={analyzeUseSourceSeparation}
-                onChange={(e) => setAnalyzeUseSourceSeparation(e.target.checked)}
-              />{" "}
-              Try vocal/drum separation for better chords
-            </label>
-            <p className="muted-hint analyze-sep-hint">
-              Slower, experimental, best for songs with vocals. Falls back safely if the separator isn&apos;t installed.
-            </p>
-          </div>
+          </details>
 
           {analyzeLoading ? (
             <div className="analyze-processing" role="status" aria-live="polite" aria-busy="true">
@@ -3539,9 +3598,13 @@ export default function Home() {
           ) : null}
 
           {analyzeError ? (
-            <p className="error" role="alert">
-              {analyzeError}
-            </p>
+            <div className="analyze-error-block" role="alert">
+              <strong className="analyze-error-title">Analysis failed</strong>
+              <p className="analyze-error-msg">{friendlyAnalyzeError(analyzeError)}</p>
+              <p className="analyze-error-hint">
+                Works best with clear audio — piano, guitar, and simple arrangements. Try a shorter clip if the file is large.
+              </p>
+            </div>
           ) : null}
 
           {analyzeFile && !analyzeResult ? (
@@ -3600,20 +3663,21 @@ export default function Home() {
               </div>
 
               <div className="analyze-chord-rail-block analyze-chord-rail-block--core">
-                <h2 className="analyze-learning-heading">Main progression</h2>
+                <h2 className="analyze-learning-heading">Simple practice progression</h2>
                 <p className="analyze-learning-lead">
-                  The song in broad strokes — tap a chord to jump where it first appears in the track.
+                  The chords you need to practice — tap one to jump where it first appears.
                 </p>
-                <div className="analyze-core-row" aria-label="Core chord progression">
-                  {                    coreProgressionDisplay.length === 0 ? (
-                    <p className="analyze-core-empty">No chord summary available for this track.</p>
+                <div className="analyze-core-row" aria-label="Simple practice progression">
+                  {simplePracticeProgressionDisplay.length === 0 ? (
+                    <p className="analyze-core-empty">No practice progression available for this track.</p>
                   ) : (
-                    coreProgressionDisplay.map((entry, i) => {
-                      const orig = coreProgression[i];
+                    simplePracticeProgressionDisplay.map((entry, i) => {
+                      const orig = simplePracticeProgression[i];
                       const isActive =
-                        orig.label === currentChordLabelForHighlight && orig.label !== "N";
+                        orig.source_labels.includes(currentChordLabelForHighlight) ||
+                        orig.label === currentChordLabelForHighlight;
                       return (
-                        <div className="analyze-core-slot" key={`${orig.label}-core-${i}`}>
+                        <div className="analyze-core-slot" key={`${orig.label}-simple-${i}`}>
                           {i > 0 ? (
                             <span className="analyze-core-arrow" aria-hidden>
                               →
@@ -3621,34 +3685,87 @@ export default function Home() {
                           ) : null}
                           <button
                             type="button"
-                            className={`analyze-core-chord${isActive ? " analyze-core-chord--active" : ""}${
-                              entry.anyLowConfidence ? " analyze-core-chord--low-conf" : ""
-                            }`}
+                            className={`analyze-core-chord${isActive ? " analyze-core-chord--active" : ""}`}
                             onClick={() => {
                               const el = analyzeAudioRef.current;
                               if (!el || !analyzeResult) return;
-                              const t = firstChordTimeForLabel(analyzeResult.chords, orig.label);
-                              if (t === null) return;
-                              el.currentTime = t;
-                              setAnalyzePlaybackTime(t);
+                              let earliest: number | null = null;
+                              for (const src of orig.source_labels) {
+                                const t = firstChordTimeForLabel(analyzeResult.chords, src);
+                                if (t !== null && (earliest === null || t < earliest)) earliest = t;
+                              }
+                              if (earliest === null) return;
+                              el.currentTime = earliest;
+                              setAnalyzePlaybackTime(earliest);
                             }}
-                            title={`Jump to first ${orig.label}`}
+                            title={`Jump to first ${entry.label}${orig.source_labels.length > 1 ? ` (from ${orig.source_labels.join(", ")})` : ""}`}
                           >
                             {isActive ? <span className="analyze-core-now">Now</span> : null}
                             <span className="analyze-core-symbol">{entry.label}</span>
-                            <span className="analyze-core-notes">{entry.notesLine}</span>
+                            <span className="analyze-core-notes">{chordNotesDisplayForLabel(entry.label)}</span>
                           </button>
                         </div>
                       );
                     })
                   )}
                 </div>
-                {analyzeResult.chords.some((c) => c.low_confidence) ? (
-                  <p className="analyze-muted-foot">
-                    Some symbols are educated guesses — trust your ears if something feels off.
-                  </p>
-                ) : null}
+                <p className="analyze-muted-foot">
+                  Simplified for practice. Detailed detected chords may include passing chords or color tones.
+                </p>
               </div>
+
+              <details className="analyze-nested-drawer">
+                <summary>Detailed detected progression</summary>
+                <div className="analyze-nested-drawer-body">
+                  <p className="analyze-more-p analyze-more-p--nested">
+                    Full chord summary including color tones and transitions — useful for advanced players.
+                  </p>
+                  <div className="analyze-core-row" aria-label="Detailed chord progression">
+                    {coreProgressionDisplay.length === 0 ? (
+                      <p className="analyze-core-empty">No chord summary available for this track.</p>
+                    ) : (
+                      coreProgressionDisplay.map((entry, i) => {
+                        const orig = coreProgression[i];
+                        const isActive =
+                          orig.label === currentChordLabelForHighlight && orig.label !== "N";
+                        return (
+                          <div className="analyze-core-slot" key={`${orig.label}-core-${i}`}>
+                            {i > 0 ? (
+                              <span className="analyze-core-arrow" aria-hidden>
+                                →
+                              </span>
+                            ) : null}
+                            <button
+                              type="button"
+                              className={`analyze-core-chord${isActive ? " analyze-core-chord--active" : ""}${
+                                entry.anyLowConfidence ? " analyze-core-chord--low-conf" : ""
+                              }`}
+                              onClick={() => {
+                                const el = analyzeAudioRef.current;
+                                if (!el || !analyzeResult) return;
+                                const t = firstChordTimeForLabel(analyzeResult.chords, orig.label);
+                                if (t === null) return;
+                                el.currentTime = t;
+                                setAnalyzePlaybackTime(t);
+                              }}
+                              title={`Jump to first ${orig.label}`}
+                            >
+                              {isActive ? <span className="analyze-core-now">Now</span> : null}
+                              <span className="analyze-core-symbol">{entry.label}</span>
+                              <span className="analyze-core-notes">{entry.notesLine}</span>
+                            </button>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                  {analyzeResult.chords.some((c) => c.low_confidence) ? (
+                    <p className="analyze-muted-foot">
+                      Some symbols are educated guesses — trust your ears if something feels off.
+                    </p>
+                  ) : null}
+                </div>
+              </details>
 
               {analyzeAudioUrl ? (
                 <div className="analyze-practice-controls-card">
@@ -4276,8 +4393,17 @@ export default function Home() {
             </div>
           ) : null}
 
-          {!analyzeResult && !analyzeLoading ? (
-            <p className="analyze-empty-hint">Choose a file and tap Analyze to see chords, sections, and practice tools.</p>
+          {!analyzeResult && !analyzeLoading && !analyzeError ? (
+            <div className="analyze-empty-cta">
+              {analyzeFile ? (
+                <p className="analyze-empty-hint">File selected — tap <strong>Analyze</strong> to get your practice roadmap.</p>
+              ) : (
+                <>
+                  <p className="analyze-empty-hint">Choose an audio file to get started.</p>
+                  <p className="analyze-empty-sub">Works best with clear recordings — piano, guitar, or simple arrangements. WAV and MP3 supported.</p>
+                </>
+              )}
+            </div>
           ) : null}
         </section>
       )}

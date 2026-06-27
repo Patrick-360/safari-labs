@@ -113,6 +113,28 @@ class RhythmHint(BaseModel):
 	)
 
 
+class SimplePracticeChord(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+	label: str = Field(..., description="Simplified beginner-friendly chord symbol")
+	source_labels: list[str] = Field(
+		default_factory=list,
+		description="Original detected labels merged/simplified into this chord",
+	)
+	total_duration: float = Field(
+		0.0,
+		description="Total seconds this chord covers across the track",
+	)
+	count: int = Field(
+		0,
+		description="Number of chord segments in the timeline contributing to this entry",
+	)
+	reason: str | None = Field(
+		None,
+		description="Simplification applied, e.g. 'simplified_major_seventh'; null when label was unchanged",
+	)
+
+
 class AnalyzeResponse(BaseModel):
 	model_config = ConfigDict(extra="forbid")
 
@@ -135,6 +157,14 @@ class AnalyzeResponse(BaseModel):
 	rhythm: RhythmHint = Field(
 		default_factory=RhythmHint,
 		description="Heuristic bar grouping from detected beats (not true meter detection)",
+	)
+	simple_practice_progression: list[SimplePracticeChord] = Field(
+		default_factory=list,
+		description=(
+			"Beginner-friendly simplified chord progression for practice roadmap. "
+			"Distinct from the full chord timeline — passing chords, short diminished, "
+			"and color tones are filtered or simplified. Use chords[] for playback."
+		),
 	)
 	debug: dict[str, Any] | None = Field(
 		default=None,

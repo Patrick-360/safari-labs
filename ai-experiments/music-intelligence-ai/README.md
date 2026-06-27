@@ -1,53 +1,67 @@
-# Music Intelligence AI
+# Music Intelligence AI — Beta
 
-A practical **MVP** for musicians: **live** chord recognition from the microphone and **full-track analysis** from an audio file—key, tempo, beat-aligned chords, coarse sections, and practice-oriented UI (timeline, progression, section looping).
+> **Upload a song. Get a practice roadmap.**
 
-No auth, payments, or training pipeline in this repo path; focus is inference + a simple Next.js client.
+AI-assisted chord roadmap with key, tempo, simple practice progression, loopable sections, speed control, and piano basics.
 
-## What the app does today
+**Beta notice:** Results are AI-assisted and should be checked by ear. Works best with clear audio — piano, guitar, and simple arrangements. Not a replacement for professional sheet music or exact transcription.
 
-| Mode | Description |
-|------|-------------|
-| **Live microphone** | Browser captures short WAV chunks (~0.5 s), `POST /stream` returns **chord**, **key** (tonally smoothed), confidences, and debug scores. Good for jamming and quick feedback. |
-| **Analyze file** | `POST /analyze` on a WAV/MP3 (etc.): **duration**, **tempo**, **global key**, **chord timeline**, **beats**, **sections** (heuristic), **rhythm hints** (assumed 4/4 bar grouping from beats). Frontend: big “now” chord, next chord, section navigation, beat-aware timeline, loop-by-section, full progression. |
+---
+
+## What the app does
+
+| Feature | Description |
+|---------|-------------|
+| **Analyze File** | Upload a WAV or MP3 and get a full practice roadmap — key, tempo, simple chord progression, loopable sections, and piano basics. **This is the main product feature.** |
+| **Simple Practice Progression** | Beginner-friendly chord roadmap derived from the detailed timeline. Strips color tones (maj7, 7ths) and filters short passing chords. |
+| **Detailed Detected Progression** | Full chord summary including color tones and transitions — available in a collapsible section. |
+| **Chord Timeline** | Beat-aligned chord-by-chord timeline used for "Now" / "Next" chord display and section looping. |
+| **Practice Sections** | Auto-detected A/B sections merged into practice parts for looping. |
+| **Speed Control** | Playback rate control (0.5×–1.0×) for slow-down practice. |
+| **Piano Basics** | Heuristic note spellings and practice hints for each chord. |
+| **Live Mic (experimental)** | Rough chord sketches from the microphone — useful for quick checks, not for full song analysis. |
 
 **Stack:** FastAPI + librosa (backend), Next.js 15 App Router (frontend).
 
-## Repository layout
+---
 
-```
-backend/     # FastAPI API: /health, /stream, /analyze
-frontend/    # Next.js UI: live + analyze-file modes
-docs/        # Specs + manual review checklist
-ml/          # Reserved for future training/experiments
-```
+## Known limitations
 
-## Prerequisites
+- Chords are **heuristic** (chroma + templates / Krumhansl) — errors expected on dense harmony, noise, or unusual tuning.
+- Works best with **clear audio** — piano, guitar, and simple arrangements.
+- **Does not work well** with noisy recordings, rap, dense mixes, or heavy reverb.
+- Live modes are **experimental** — rougher than file analysis.
+- Sections and rhythm bar lines are heuristic (assumes 4/4).
+- Not a perfect transcription — check all results by ear.
 
-- **Python** 3.11+ recommended (3.13 works with current deps in many setups)
+---
+
+## Quick start (local)
+
+### Prerequisites
+
+- **Python** 3.11+ (3.13 tested)
 - **Node.js** 18+ and npm
 
-## Quick start (local review / demo)
-
-### 1. Backend
+### Backend
 
 ```bash
 cd backend
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Run the API (from `backend/` so `app` resolves):
+Start the API (run from `backend/` so `app` resolves):
 
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
 - API: **http://localhost:8000**
-- Health: **GET** http://localhost:8000/health
+- Health check: **GET** http://localhost:8000/health → `{"status": "ok"}`
 
-### 2. Frontend
+### Frontend
 
 ```bash
 cd frontend
@@ -56,72 +70,102 @@ npm run dev
 ```
 
 - App: **http://localhost:3000**
-- By default the UI calls **http://localhost:8000** (see `NEXT_PUBLIC_API_URL` below).
+- By default calls **http://localhost:8000** (see `NEXT_PUBLIC_API_URL` below).
 
-### 3. Wire frontend ↔ backend (when not on localhost defaults)
+---
 
-| Variable | Where | Purpose |
-|----------|--------|---------|
-| `NEXT_PUBLIC_API_URL` | `frontend/.env.local` | API base URL, **no trailing slash** (e.g. `https://api.example.com`). Example file: `frontend/.env.local.example`. |
-| `CORS_ORIGINS` | Shell or `backend/.env` + your loader | Comma-separated **browser origins** allowed to call the API. Default if unset: `http://localhost:3000`. Example: `backend/.env.example`. |
+## Environment variables
 
-**Production-style example:**
+### Frontend
 
-```bash
-export CORS_ORIGINS="https://your-app.vercel.app,http://localhost:3000"
-# start uvicorn …
-```
+| Variable | Required for | Default | Example |
+|----------|-------------|---------|---------|
+| `NEXT_PUBLIC_API_URL` | Deployed frontend → deployed backend | `http://localhost:8000` | `https://your-api.example.com` |
+
+Set in `frontend/.env.local` (not committed):
 
 ```bash
-# frontend/.env.local
 NEXT_PUBLIC_API_URL=https://your-api.example.com
 ```
 
-FastAPI does not load `.env` automatically; use `export`, a process manager, or add `python-dotenv` later if you want file-based loading.
+Example file: `frontend/.env.local.example`
 
-## Testing (automated)
+### Backend
 
-From **`backend/`** with venv activated:
+| Variable | Required for | Default | Example |
+|----------|-------------|---------|---------|
+| `CORS_ORIGINS` | Deployed backend to allow deployed frontend | `http://localhost:3000` | `https://your-app.vercel.app,http://localhost:3000` |
+| `PORT` | Deployment platforms (Render, Railway) | 8000 | `8000` |
+
+FastAPI does **not** auto-load `.env` — use `export`, a process manager, or add `python-dotenv`.
+
+Example:
 
 ```bash
+export CORS_ORIGINS="https://your-app.vercel.app,http://localhost:3000"
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Example file: `backend/.env.example`
+
+---
+
+## Deployment
+
+See **[docs/deployment.md](docs/deployment.md)** for full deployment instructions including Vercel (frontend) and Render/Railway (backend).
+
+---
+
+## Testing
+
+### Backend unit tests
+
+```bash
+cd backend
+source .venv/bin/activate
 python -m unittest discover -v -s tests -p 'test_*.py'
 ```
 
-Covers: **`/health`**, **`/stream`** JSON contract (silent WAV), **`/analyze`** shape (including sections + rhythm), and a small key-scoring sanity check.
+Covers: `/health`, `/stream` contract, `/analyze` schema, key-scoring sanity.
 
-Optional script (HTTP against a **running** server):
+### Backend smoke test (requires running server)
 
 ```bash
 bash backend/scripts/smoke_analyze.sh
 ```
 
-Frontend production build:
+### Frontend production build
 
 ```bash
-cd frontend && npm run build
+cd frontend
+npm run build
 ```
+
+---
 
 ## Manual review checklist
 
-For a full walkthrough (live silence, key stability, analyze playback, loop, etc.), use:
+Full walkthrough (silence handling, key stability, analyze playback, loop, etc.):
 
 **[docs/MANUAL_REVIEW_CHECKLIST.md](docs/MANUAL_REVIEW_CHECKLIST.md)**
 
-## Roadmap (future phases)
+---
 
-Ideas only—not committed scope:
+## Repository layout
 
-- **Audio:** melody/bass line or separation (larger DSP / ML scope)
-- **Analysis:** stronger meter / downbeat, richer section labels (verse/chorus) if still lightweight
-- **Practice:** metronome click, speed control, export lead sheets
-- **Ops:** Docker image, CI matrix, pinned prod configs
+```
+backend/     FastAPI API: /health, /stream, /analyze, /live-transcribe
+frontend/    Next.js UI: Analyze File (primary) + Live mic (experimental)
+docs/        Specs, deployment guide, manual review checklist
+ml/          Reserved for future training/experiments
+```
 
-## Limitations (MVP)
+---
 
-- Chords/keys are **heuristic** (chroma + templates / Krumhansl); errors on dense harmony, tuning, or noise are expected.
-- **Live key** is smoothed for stability; it is not a real-time Roman-numeral analysis engine.
-- **Analyze** sections and **rhythm** bar lines are **heuristic** (e.g. assumed 4/4 from beat indices).
+## Roadmap (future, not committed)
 
-## License / ownership
-
-Add your license here if applicable.
+- Stronger meter / downbeat detection
+- Verse/chorus section labels
+- Export to PDF / lead sheet
+- Mobile app (React Native / Expo — not in this repo)
+- Docker image and CI matrix

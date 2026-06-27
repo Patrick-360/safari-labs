@@ -64,6 +64,7 @@ from app.models.chords import (
 	build_analyze_mvp_templates,
 	build_analyze_theory_templates,
 )
+from app.audio.simplify_progression import compute_simple_practice_progression
 from app.core.config import ENABLE_ML_CHORDS, ENABLE_PITCH_TRANSCRIPTION, ENABLE_SOURCE_SEPARATION
 from app.ml import StemBundle, predict_chords_ml, separate_sources, transcribe_pitch
 
@@ -2573,6 +2574,10 @@ def run_analysis(
 			sep_result.backend,
 		)
 
+	simple_practice_prog, simple_debug = compute_simple_practice_progression(
+		chords, duration_sec, debug=debug
+	)
+
 	payload: Dict[str, Any] = {
 		"duration": round(duration_sec, 4),
 		"tempo": round(bpm, 2),
@@ -2585,6 +2590,7 @@ def run_analysis(
 		"beats": beats_payload,
 		"sections": sections,
 		"rhythm": rhythm,
+		"simple_practice_progression": simple_practice_prog,
 	}
 	if debug:
 		dbg = _build_analyze_debug(
@@ -2639,5 +2645,6 @@ def run_analysis(
 		))
 		dbg["segments_pre_refine_count"] = len(chords_pre_snapshot)
 		dbg["chord_quality_summary"] = _chord_quality_summary(chords)
+		dbg.update(simple_debug)
 		payload["debug"] = dbg
 	return payload

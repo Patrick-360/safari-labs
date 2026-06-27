@@ -54,11 +54,24 @@ body {
 }
 
 .hero-sub {
-  margin: 0 0 0.85rem;
+  margin: 0 0 0.5rem;
   font-size: 0.95rem;
   color: var(--text-muted);
   line-height: 1.4;
   max-width: 36rem;
+}
+
+.hero-beta {
+  display: inline-block;
+  margin: 0 0 0.85rem;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--surface) 80%, var(--border));
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  letter-spacing: 0.02em;
 }
 
 .mode-intro {
@@ -1223,6 +1236,11 @@ body {
   cursor: not-allowed;
 }
 
+.analyze-run-btn--waiting {
+  background: color-mix(in srgb, var(--accent) 60%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+}
+
 .analyze-processing {
   display: flex;
   gap: 1rem;
@@ -2099,6 +2117,93 @@ body {
   margin: 0.75rem 0 0;
   font-size: 0.92rem;
   color: var(--text-muted);
+}
+
+.analyze-empty-cta {
+  margin: 1.5rem 0;
+  padding: 1.25rem 1.5rem;
+  border-radius: var(--radius);
+  border: 2px dashed color-mix(in srgb, var(--border) 80%, var(--accent) 20%);
+  background: color-mix(in srgb, var(--surface) 60%, var(--bg));
+  text-align: center;
+}
+
+.analyze-empty-cta .analyze-empty-hint {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.analyze-empty-sub {
+  margin: 0;
+  font-size: 0.87rem;
+  color: var(--text-muted);
+}
+
+.analyze-error-block {
+  margin: 1rem 0;
+  padding: 0.85rem 1rem;
+  border-radius: var(--radius);
+  border-left: 3px solid var(--error);
+  background: color-mix(in srgb, var(--error) 8%, var(--bg));
+}
+
+.analyze-error-title {
+  display: block;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--error);
+  margin-bottom: 0.3rem;
+}
+
+.analyze-error-msg {
+  margin: 0 0 0.3rem;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.analyze-error-hint {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.analyze-limitations-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.83rem;
+  color: var(--text-muted);
+  font-style: italic;
+  max-width: 44rem;
+  line-height: 1.45;
+}
+
+.analyze-advanced-summary {
+  cursor: pointer;
+  font-size: 0.84rem;
+  color: var(--text-muted);
+}
+
+.live-experimental-banner {
+  margin-bottom: 1rem;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--border) 80%, #f5a623);
+  background: color-mix(in srgb, var(--surface) 70%, #fff8ed);
+  font-size: 0.87rem;
+  color: var(--text-muted);
+}
+
+.live-switch-to-file-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .analyze-row {
