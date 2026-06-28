@@ -213,6 +213,49 @@ def _probe_audio_duration_sec(data: bytes) -> float | None:
 		return None
 
 
+def load_audio_from_path(
+	path: str,
+	sr: int = ANALYSIS_SR,
+	duration: float | None = None,
+) -> Tuple[np.ndarray, int]:
+	"""Load audio directly from a file path without creating a BytesIO buffer.
+
+	For WAV/FLAC/OGG, soundfile can seek to decode only `duration` seconds without
+	reading the full file into RAM.  For MP3, audioread decodes progressively and
+	stops at `duration` seconds.  Either way the peak in-memory footprint is bounded
+	to the decoded numpy array size, not the compressed file size.
+	"""
+	y, _ = librosa.load(path, sr=sr, mono=True, duration=duration)
+	if y.size == 0:
+		raise ValueError("Decoded waveform is empty.")
+	return y.astype(np.float32, copy=False), sr
+
+
+def _probe_audio_duration_from_path(path: str) -> float | None:
+	"""Return audio duration from a file header without full decode.
+
+	Works for WAV, FLAC, OGG, AIFF via soundfile.  Returns None for MP3 (soundfile
+	does not support MP3 directly) — callers treat None as 'unknown'.
+	"""
+	try:
+		import soundfile as sf
+		info = sf.info(path)
+		return float(info.duration)
+	except Exception:
+		return None
+
+
+def _count_label_runs(seq: list) -> int:
+	"""Count distinct consecutive runs in a label sequence."""
+	n = 0
+	prev: str | None = None
+	for lbl in seq:
+		if lbl != prev:
+			n += 1
+			prev = lbl
+	return n
+
+
 def _expand_tempo_octave_candidates(values: Iterable[float]) -> List[float]:
 	out: set[float] = set()
 	for v in values:
@@ -2493,43 +2536,23 @@ def _mix_key_audio_from_stems(stems: StemBundle, chord_wave: np.ndarray) -> np.n
 	return out
 
 
-def run_analysis(
-	audio_bytes: bytes,
+def _analyze_waveform(
+	y: np.ndarray,
+	sr: int,
+	duration_sec: float,
+	analysis_window: Dict[str, Any],
 	*,
 	debug: bool = False,
 	use_source_separation: bool = False,
 	engine: str | None = None,
+	upload_size_bytes: int = 0,
 ) -> Dict[str, Any]:
-	# Reject files that are too large to process safely on constrained instances.
-	max_bytes = BETA_MAX_UPLOAD_SIZE_MB * 1024 * 1024
-	if len(audio_bytes) > max_bytes:
-		raise ValueError(
-			f"file_too_large: uploaded file exceeds the {BETA_MAX_UPLOAD_SIZE_MB}MB beta limit."
-		)
+	"""Run the full chord/tempo/key/section analysis on an already-decoded waveform.
 
-	# Decode only the first BETA_MAX_ANALYSIS_DURATION_SEC seconds.  This avoids
-	# allocating a full-song numpy array and keeps Render 512MB instances stable.
-	y, sr = load_audio_bytes(audio_bytes, sr=ANALYSIS_SR, duration=BETA_MAX_ANALYSIS_DURATION_SEC)
-	if y.size < sr * 0.2:
-		raise ValueError("Audio is too short for analysis (need at least ~0.2s).")
-
-	y_duration = float(len(y)) / float(sr)
-	# If the loaded length is within 0.5 s of the cap, the original was longer.
-	was_trimmed = y_duration >= BETA_MAX_ANALYSIS_DURATION_SEC - 0.5
-	if was_trimmed:
-		original_duration_sec = _probe_audio_duration_sec(audio_bytes)
-	else:
-		original_duration_sec = y_duration
-	analysis_window: Dict[str, Any] = {
-		"start": 0.0,
-		"end": round(y_duration, 4),
-		"duration_analyzed": round(y_duration, 4),
-		"was_trimmed": was_trimmed,
-		"original_duration": round(original_duration_sec, 4) if original_duration_sec is not None else None,
-		"reason": "beta_duration_limit" if was_trimmed else None,
-	}
-
-	duration_sec = y_duration
+	Separated from loading so both the bytes entry point (run_analysis) and the
+	file-path entry point (run_analysis_from_path) can share this code without
+	duplicating ~150 lines.
+	"""
 	separation_requested = bool(use_source_separation) or ENABLE_SOURCE_SEPARATION
 	sep_result = separate_sources(y, sr, enabled=separation_requested)
 	stems = sep_result.stems
@@ -2556,7 +2579,7 @@ def run_analysis(
 		chroma_for_key = _temporal_smooth_chroma(chroma_raw_k, smooth_frames)
 	key_label, key_raw, key_conf = global_key_from_chroma(chroma_for_key)
 
-	# --- Pitch / chord ML prelude (still no fusion): uses same stem chord_wave rides on ---
+	# --- Pitch / chord ML prelude (still no fusion) ---
 	note_events = transcribe_pitch(stems.other, sr, enabled=ENABLE_PITCH_TRANSCRIPTION)
 	ml_chords = predict_chords_ml(stems.other, sr, enabled=ENABLE_ML_CHORDS)
 	_ = (note_events, ml_chords)
@@ -2621,14 +2644,7 @@ def run_analysis(
 		mean_cf = float(np.mean([float(c.get("confidence", 0.0)) for c in chords])) if chords else 0.0
 		log.debug(
 			"analyze: duration=%.2fs bpm=%.1f key=%r raw=%r kconf=%.2f segments=%d mean_conf=%.2f sep_backend=%s",
-			duration_sec,
-			bpm,
-			key_label,
-			key_raw,
-			key_conf,
-			len(chords),
-			mean_cf,
-			sep_result.backend,
+			duration_sec, bpm, key_label, key_raw, key_conf, len(chords), mean_cf, sep_result.backend,
 		)
 
 	simple_practice_prog, simple_debug = compute_simple_practice_progression(
@@ -2680,17 +2696,8 @@ def run_analysis(
 		dbg["normalized_tempo_bpm"] = tempo_meta["normalized_tempo_bpm"]
 		dbg["tempo_reason"] = tempo_meta["tempo_reason"]
 		dbg["tempo_candidates"] = tempo_meta.get("tempo_candidates", [])
-		# Compute post-sticky and post-median run counts from slot granular data.
 		_sticky_labels = (slot_granular or {}).get("labels_after_sticky", [])
 		_median_labels = (slot_granular or {}).get("labels_after_median", [])
-		def _count_runs(seq: list) -> int:
-			n = 0
-			prev: str | None = None
-			for l in seq:
-				if l != prev:
-					n += 1
-					prev = l
-			return n
 		dbg.update(_filtering_debug_stats(
 			chords_pre_snapshot, chords,
 			raw_frame_count=int(chroma.shape[1]),
@@ -2698,11 +2705,105 @@ def run_analysis(
 			guardrail_splits=guardrail_splits,
 			longest_before_guardrail=longest_before_guardrail,
 			longest_after_guardrail=longest_after_guardrail,
-			post_sticky_segment_count=_count_runs(_sticky_labels),
-			post_median_segment_count=_count_runs(_median_labels),
+			post_sticky_segment_count=_count_label_runs(_sticky_labels),
+			post_median_segment_count=_count_label_runs(_median_labels),
 		))
 		dbg["segments_pre_refine_count"] = len(chords_pre_snapshot)
 		dbg["chord_quality_summary"] = _chord_quality_summary(chords)
+		dbg["upload_size_bytes"] = upload_size_bytes
+		dbg["beta_max_upload_size_mb"] = BETA_MAX_UPLOAD_SIZE_MB
+		dbg["analysis_window"] = analysis_window
 		dbg.update(simple_debug)
 		payload["debug"] = dbg
 	return payload
+
+
+def run_analysis(
+	audio_bytes: bytes,
+	*,
+	debug: bool = False,
+	use_source_separation: bool = False,
+	engine: str | None = None,
+) -> Dict[str, Any]:
+	"""Analyze audio from raw bytes.  Kept for backward compatibility with tests and scripts.
+
+	For the production HTTP path, prefer run_analysis_from_path which streams the
+	upload to disk and never holds the full file bytes in RAM.
+	"""
+	max_bytes = BETA_MAX_UPLOAD_SIZE_MB * 1024 * 1024
+	if len(audio_bytes) > max_bytes:
+		raise ValueError(
+			f"file_too_large: uploaded file exceeds the {BETA_MAX_UPLOAD_SIZE_MB}MB beta limit."
+		)
+
+	y, sr = load_audio_bytes(audio_bytes, sr=ANALYSIS_SR, duration=BETA_MAX_ANALYSIS_DURATION_SEC)
+	if y.size < sr * 0.2:
+		raise ValueError("Audio is too short for analysis (need at least ~0.2s).")
+
+	y_duration = float(len(y)) / float(sr)
+	was_trimmed = y_duration >= BETA_MAX_ANALYSIS_DURATION_SEC - 0.5
+	original_duration_sec = _probe_audio_duration_sec(audio_bytes) if was_trimmed else y_duration
+	analysis_window: Dict[str, Any] = {
+		"start": 0.0,
+		"end": round(y_duration, 4),
+		"duration_analyzed": round(y_duration, 4),
+		"was_trimmed": was_trimmed,
+		"original_duration": round(original_duration_sec, 4) if original_duration_sec is not None else None,
+		"reason": "beta_duration_limit" if was_trimmed else None,
+	}
+	return _analyze_waveform(
+		y, sr, y_duration, analysis_window,
+		debug=debug,
+		use_source_separation=use_source_separation,
+		engine=engine,
+		upload_size_bytes=len(audio_bytes),
+	)
+
+
+def run_analysis_from_path(
+	audio_path: str,
+	*,
+	upload_size_bytes: int = 0,
+	debug: bool = False,
+	use_source_separation: bool = False,
+	engine: str | None = None,
+) -> Dict[str, Any]:
+	"""Analyze audio from a file path — the memory-safe production entry point.
+
+	Unlike run_analysis(bytes), this function never holds the full upload in RAM.
+	librosa.load reads directly from the path:
+	  - WAV/FLAC: soundfile uses a file seek to read only `duration` seconds of samples.
+	  - MP3: audioread decodes progressively and stops at `duration` seconds.
+	Peak in-memory audio footprint = ~8 MB (90 s × 22050 Hz × float32),
+	regardless of how large the original file is.
+	"""
+	log.info(
+		"analyze: loading from temp file path=%s upload_bytes=%d beta_duration_sec=%.0f",
+		audio_path, upload_size_bytes, BETA_MAX_ANALYSIS_DURATION_SEC,
+	)
+	y, sr = load_audio_from_path(audio_path, sr=ANALYSIS_SR, duration=BETA_MAX_ANALYSIS_DURATION_SEC)
+	if y.size < sr * 0.2:
+		raise ValueError("Audio is too short for analysis (need at least ~0.2s).")
+
+	y_duration = float(len(y)) / float(sr)
+	was_trimmed = y_duration >= BETA_MAX_ANALYSIS_DURATION_SEC - 0.5
+	original_duration_sec = _probe_audio_duration_from_path(audio_path) if was_trimmed else y_duration
+	analysis_window: Dict[str, Any] = {
+		"start": 0.0,
+		"end": round(y_duration, 4),
+		"duration_analyzed": round(y_duration, 4),
+		"was_trimmed": was_trimmed,
+		"original_duration": round(original_duration_sec, 4) if original_duration_sec is not None else None,
+		"reason": "beta_duration_limit" if was_trimmed else None,
+	}
+	log.info(
+		"analyze: waveform loaded duration=%.2fs was_trimmed=%s original_duration=%s",
+		y_duration, was_trimmed, original_duration_sec,
+	)
+	return _analyze_waveform(
+		y, sr, y_duration, analysis_window,
+		debug=debug,
+		use_source_separation=use_source_separation,
+		engine=engine,
+		upload_size_bytes=upload_size_bytes,
+	)
