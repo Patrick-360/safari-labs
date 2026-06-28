@@ -5,9 +5,12 @@ from pydantic import ValidationError
 
 from app.audio.analyze_pipeline import run_analysis
 from app.audio.chord_analysis_preset import DEFAULT_CHORD_ENGINE
+from app.core.config import BETA_MAX_UPLOAD_SIZE_MB
 from app.schemas.analyze import AnalyzeResponse
 
 router = APIRouter()
+
+_MAX_UPLOAD_BYTES = BETA_MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
@@ -41,6 +44,17 @@ async def analyze_track(
 				detail={
 					"error": "empty_upload",
 					"message": "No audio bytes were received. Use form field name 'file', or ensure the file is non-empty.",
+				},
+			)
+		if len(audio_bytes) > _MAX_UPLOAD_BYTES:
+			raise HTTPException(
+				status_code=400,
+				detail={
+					"error": "file_too_large",
+					"message": (
+						f"File is {len(audio_bytes) // (1024 * 1024)}MB — the beta limit is {BETA_MAX_UPLOAD_SIZE_MB}MB. "
+						"Try an MP3 under 30MB or trim to a shorter clip."
+					),
 				},
 			)
 		payload = run_analysis(

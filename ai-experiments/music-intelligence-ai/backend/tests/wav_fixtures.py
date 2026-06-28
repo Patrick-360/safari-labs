@@ -18,6 +18,18 @@ def one_second_silent_wav() -> bytes:
 	return buf.getvalue()
 
 
+def n_seconds_silent_wav(duration_sec: float, sr: int = 22050) -> bytes:
+	"""Mono PCM16 silence of exactly `duration_sec` seconds."""
+	buf = io.BytesIO()
+	n_frames = int(sr * duration_sec)
+	with wave.open(buf, "wb") as w:
+		w.setnchannels(1)
+		w.setsampwidth(2)
+		w.setframerate(sr)
+		w.writeframes(b"\x00\x00" * n_frames)
+	return buf.getvalue()
+
+
 def half_second_tone_wav(*, freq_hz: float = 261.63, sr: int = 22050, duration_sec: float = 0.6) -> bytes:
 	"""Mono PCM16 sine — enough samples for chroma / stream path smoke tests."""
 	buf = io.BytesIO()

@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 
-from tests.wav_fixtures import one_second_silent_wav
+from tests.wav_fixtures import n_seconds_silent_wav, one_second_silent_wav
 
 
 class TestAnalyzeSmoke(unittest.TestCase):
@@ -72,6 +72,49 @@ class TestAnalyzeSmoke(unittest.TestCase):
 		res = client.post("/analyze", params={"engine": "stable"}, files={"file": ("test.wav", wav_bytes, "audio/wav")})
 		self.assertEqual(res.status_code, 200, res.text)
 		self.assertEqual(res.json().get("chord_engine"), "stable")
+
+	def test_short_file_analysis_window_not_trimmed(self) -> None:
+		"""A short file (1 s) must return analysis_window with was_trimmed=False."""
+		client = TestClient(app)
+		wav_bytes = one_second_silent_wav()
+		res = client.post("/analyze", files={"file": ("test.wav", wav_bytes, "audio/wav")})
+		self.assertEqual(res.status_code, 200, res.text)
+		data = res.json()
+		self.assertIn("analysis_window", data)
+		aw = data["analysis_window"]
+		self.assertIsNotNone(aw)
+		self.assertFalse(aw["was_trimmed"])
+		self.assertIsNone(aw["reason"])
+		self.assertGreater(aw["duration_analyzed"], 0.0)
+		self.assertLess(aw["duration_analyzed"], 90.0)
+
+	def test_long_file_analysis_window_trimmed(self) -> None:
+		"""A 100-second WAV must be trimmed to ~90 s and report was_trimmed=True."""
+		client = TestClient(app)
+		wav_bytes = n_seconds_silent_wav(100.0)
+		res = client.post("/analyze", files={"file": ("long.wav", wav_bytes, "audio/wav")})
+		self.assertEqual(res.status_code, 200, res.text)
+		data = res.json()
+		self.assertIn("analysis_window", data)
+		aw = data["analysis_window"]
+		self.assertTrue(aw["was_trimmed"])
+		self.assertEqual(aw["reason"], "beta_duration_limit")
+		# duration_analyzed must be close to the 90-second cap
+		self.assertAlmostEqual(aw["duration_analyzed"], 90.0, delta=1.0)
+		# original_duration available from WAV header probe
+		self.assertIsNotNone(aw["original_duration"])
+		self.assertGreater(aw["original_duration"], 90.0)
+
+	def test_oversized_file_returns_friendly_error(self) -> None:
+		"""A file exceeding the 30MB limit must return 400 with error=file_too_large."""
+		from app.core.config import BETA_MAX_UPLOAD_SIZE_MB
+		client = TestClient(app)
+		# Create a fake payload just over the limit (use raw bytes, not a valid WAV).
+		oversize = b"\x00" * (BETA_MAX_UPLOAD_SIZE_MB * 1024 * 1024 + 1)
+		res = client.post("/analyze", files={"file": ("big.wav", oversize, "audio/wav")})
+		self.assertEqual(res.status_code, 400)
+		detail = res.json().get("detail", {})
+		self.assertEqual(detail.get("error"), "file_too_large")
 
 
 if __name__ == "__main__":

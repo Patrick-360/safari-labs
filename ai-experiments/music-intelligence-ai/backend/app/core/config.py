@@ -16,3 +16,10 @@ ENABLE_PITCH_TRANSCRIPTION = False
 # When True: run learned chord predictor (CNN/CRNN/Transformer backends TBD).
 # Fallback (False): template chroma path only; richer qualities (dim/aug/7ths) deferred to future fusion.
 ENABLE_ML_CHORDS = False
+
+# --- Beta resource limits ---
+# Analyze only the first N seconds to keep Render 512MB instances stable.
+# Raise these constants when moving to a larger plan.
+BETA_MAX_ANALYSIS_DURATION_SEC: float = 90.0
+# Reject uploads above this size before decoding to prevent OOM on large files.
+BETA_MAX_UPLOAD_SIZE_MB: int = 30

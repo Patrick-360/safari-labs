@@ -158,14 +158,33 @@ If `CORS_ORIGINS` is not set, only `http://localhost:3000` is allowed. Your depl
 
 ---
 
-## File upload limits
+## Beta memory limits and audio trimming
 
-FastAPI/Starlette has no hardcoded limit; Uvicorn defaults to no body size limit. For production, either:
+The backend is tuned for Render Starter (512MB RAM) instances.  Two constants in
+`backend/app/core/config.py` control this:
 
-- Add Nginx in front with `client_max_body_size 50m;`
-- Or rely on Render/Railway's proxy limits (usually 100MB+)
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `BETA_MAX_UPLOAD_SIZE_MB` | 30 | Files larger than this are rejected with a friendly 400 error |
+| `BETA_MAX_ANALYSIS_DURATION_SEC` | 90 | Only the first N seconds of a long file are decoded and analyzed |
 
-For beta, files up to ~100MB should work. Analysis of files over 5 minutes may take 15–30 seconds.
+**Why trimming helps memory:**
+librosa decodes audio into a float32 numpy array.  A 5-minute mono track at 22050 Hz is
+~26 MB of RAM before HPSS and chroma processing.  Capping at 90 s keeps the array
+under 8 MB, which fits comfortably in 512 MB alongside librosa's processing buffers.
+
+**Frontend behavior:**
+When `analysis_window.was_trimmed === true` in the API response, the UI shows a note:
+"Beta note: This song was longer than 90 seconds, so we analyzed the first 90 seconds."
+
+**How to increase limits:**
+Upgrade the Render plan to 2 GB RAM, then raise both constants and redeploy.
+Recommended: `BETA_MAX_ANALYSIS_DURATION_SEC = 300` (5 min) on 2 GB, or 600 on 4 GB.
+
+**Upload format guidance for beta testers:**
+- Recommended: MP3 under 30 MB (roughly 30 minutes at 128 kbps)
+- WAV works but is larger per minute — keep under 30 MB (≈ 3 min of 16-bit 44.1 kHz stereo)
+- Full album uploads will be rejected; single-song uploads are fine
 
 ---
 

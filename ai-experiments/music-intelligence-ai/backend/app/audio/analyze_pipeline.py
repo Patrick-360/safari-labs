@@ -65,7 +65,13 @@ from app.models.chords import (
 	build_analyze_theory_templates,
 )
 from app.audio.simplify_progression import compute_simple_practice_progression
-from app.core.config import ENABLE_ML_CHORDS, ENABLE_PITCH_TRANSCRIPTION, ENABLE_SOURCE_SEPARATION
+from app.core.config import (
+	BETA_MAX_ANALYSIS_DURATION_SEC,
+	BETA_MAX_UPLOAD_SIZE_MB,
+	ENABLE_ML_CHORDS,
+	ENABLE_PITCH_TRANSCRIPTION,
+	ENABLE_SOURCE_SEPARATION,
+)
 from app.ml import StemBundle, predict_chords_ml, separate_sources, transcribe_pitch
 
 log = logging.getLogger(__name__)
@@ -170,15 +176,41 @@ CORE_ONE_OFF_MAX_SEC = 0.95
 CORE_RARE_LABEL_TOTAL_SEC = 0.50
 
 
-def load_audio_bytes(data: bytes, sr: int = ANALYSIS_SR) -> Tuple[np.ndarray, int]:
-	"""Load WAV/MP3/etc. via librosa; mono, resampled to `sr`."""
+def load_audio_bytes(
+	data: bytes,
+	sr: int = ANALYSIS_SR,
+	duration: float | None = None,
+) -> Tuple[np.ndarray, int]:
+	"""Load WAV/MP3/etc. via librosa; mono, resampled to `sr`.
+
+	When `duration` is set, decode only the first N seconds.  For WAV/FLAC this is
+	seek-efficient (soundfile reads only the needed frames); for MP3 decoding stops
+	early via audioread.  Either way the returned array is bounded to `duration` seconds,
+	which avoids allocating a full-song numpy buffer for long uploads.
+	"""
 	if not data:
 		raise ValueError("audio_bytes is empty.")
 	with io.BytesIO(data) as buf:
-		y, _ = librosa.load(buf, sr=sr, mono=True)
+		y, _ = librosa.load(buf, sr=sr, mono=True, duration=duration)
 	if y.size == 0:
 		raise ValueError("Decoded waveform is empty.")
 	return y.astype(np.float32, copy=False), sr
+
+
+def _probe_audio_duration_sec(data: bytes) -> float | None:
+	"""Return audio duration from the file header without full decode.
+
+	Uses soundfile.info (supports WAV, FLAC, OGG, AIFF).  Returns None for formats
+	that soundfile cannot read (e.g. MP3), which is acceptable — callers treat None
+	as 'unknown original duration'.
+	"""
+	try:
+		import soundfile as sf
+		with io.BytesIO(data) as buf:
+			info = sf.info(buf)
+			return float(info.duration)
+	except Exception:
+		return None
 
 
 def _expand_tempo_octave_candidates(values: Iterable[float]) -> List[float]:
@@ -2468,11 +2500,36 @@ def run_analysis(
 	use_source_separation: bool = False,
 	engine: str | None = None,
 ) -> Dict[str, Any]:
-	y, sr = load_audio_bytes(audio_bytes, sr=ANALYSIS_SR)
+	# Reject files that are too large to process safely on constrained instances.
+	max_bytes = BETA_MAX_UPLOAD_SIZE_MB * 1024 * 1024
+	if len(audio_bytes) > max_bytes:
+		raise ValueError(
+			f"file_too_large: uploaded file exceeds the {BETA_MAX_UPLOAD_SIZE_MB}MB beta limit."
+		)
+
+	# Decode only the first BETA_MAX_ANALYSIS_DURATION_SEC seconds.  This avoids
+	# allocating a full-song numpy array and keeps Render 512MB instances stable.
+	y, sr = load_audio_bytes(audio_bytes, sr=ANALYSIS_SR, duration=BETA_MAX_ANALYSIS_DURATION_SEC)
 	if y.size < sr * 0.2:
 		raise ValueError("Audio is too short for analysis (need at least ~0.2s).")
 
-	duration_sec = float(len(y)) / float(sr)
+	y_duration = float(len(y)) / float(sr)
+	# If the loaded length is within 0.5 s of the cap, the original was longer.
+	was_trimmed = y_duration >= BETA_MAX_ANALYSIS_DURATION_SEC - 0.5
+	if was_trimmed:
+		original_duration_sec = _probe_audio_duration_sec(audio_bytes)
+	else:
+		original_duration_sec = y_duration
+	analysis_window: Dict[str, Any] = {
+		"start": 0.0,
+		"end": round(y_duration, 4),
+		"duration_analyzed": round(y_duration, 4),
+		"was_trimmed": was_trimmed,
+		"original_duration": round(original_duration_sec, 4) if original_duration_sec is not None else None,
+		"reason": "beta_duration_limit" if was_trimmed else None,
+	}
+
+	duration_sec = y_duration
 	separation_requested = bool(use_source_separation) or ENABLE_SOURCE_SEPARATION
 	sep_result = separate_sources(y, sr, enabled=separation_requested)
 	stems = sep_result.stems
@@ -2591,6 +2648,7 @@ def run_analysis(
 		"sections": sections,
 		"rhythm": rhythm,
 		"simple_practice_progression": simple_practice_prog,
+		"analysis_window": analysis_window,
 	}
 	if debug:
 		dbg = _build_analyze_debug(

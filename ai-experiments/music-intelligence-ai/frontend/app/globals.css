@@ -2141,6 +2141,17 @@ body {
   color: var(--text-muted);
 }
 
+.analyze-trim-note {
+  margin: 0.75rem 0 0.5rem;
+  padding: 0.65rem 0.9rem;
+  border-radius: var(--radius);
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+  font-size: 0.86rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
 .analyze-error-block {
   margin: 1rem 0;
   padding: 0.85rem 1rem;

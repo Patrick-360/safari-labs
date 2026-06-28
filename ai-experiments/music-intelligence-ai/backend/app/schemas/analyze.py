@@ -135,6 +135,26 @@ class SimplePracticeChord(BaseModel):
 	)
 
 
+class AnalysisWindow(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+	start: float = Field(0.0, description="Analysis start time in seconds (always 0 for beta)")
+	end: float = Field(..., description="Analysis end time in seconds")
+	duration_analyzed: float = Field(..., description="Seconds of audio that were actually analyzed")
+	was_trimmed: bool = Field(
+		False,
+		description="True when the uploaded file was longer than the analysis window",
+	)
+	original_duration: float | None = Field(
+		None,
+		description="Full file duration in seconds; None when the format does not support header-only probing (e.g. MP3)",
+	)
+	reason: str | None = Field(
+		None,
+		description="Why the window was limited, e.g. 'beta_duration_limit'; null for short files",
+	)
+
+
 class AnalyzeResponse(BaseModel):
 	model_config = ConfigDict(extra="forbid")
 
@@ -164,6 +184,14 @@ class AnalyzeResponse(BaseModel):
 			"Beginner-friendly simplified chord progression for practice roadmap. "
 			"Distinct from the full chord timeline — passing chords, short diminished, "
 			"and color tones are filtered or simplified. Use chords[] for playback."
+		),
+	)
+	analysis_window: AnalysisWindow | None = Field(
+		default=None,
+		description=(
+			"Describes which portion of the audio was analyzed. For beta deployments with "
+			"memory constraints, long files are trimmed to the first 90 seconds. "
+			"was_trimmed=true signals the frontend to show a trimming notice."
 		),
 	)
 	debug: dict[str, Any] | None = Field(

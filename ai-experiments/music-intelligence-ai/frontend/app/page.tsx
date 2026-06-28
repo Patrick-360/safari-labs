@@ -446,6 +446,15 @@ type SimplePracticeChord = {
   reason?: string | null;
 };
 
+type AnalysisWindow = {
+  start: number;
+  end: number;
+  duration_analyzed: number;
+  was_trimmed: boolean;
+  original_duration: number | null;
+  reason: string | null;
+};
+
 type AnalyzeApiResponse = {
   duration: number;
   tempo: number;
@@ -456,6 +465,7 @@ type AnalyzeApiResponse = {
   sections: { index: number; start: number; end: number; label: string; repeat_group?: string | null }[];
   rhythm?: AnalyzeRhythm;
   simple_practice_progression?: SimplePracticeChord[];
+  analysis_window?: AnalysisWindow;
   debug?: Record<string, unknown>;
 };
 
@@ -837,8 +847,11 @@ function friendlyAnalyzeError(raw: string): string {
   if (r.includes("failed to fetch") || r.includes("networkerror") || r.includes("network request failed") || r.includes("load failed")) {
     return "Could not reach the analysis server. Check that the backend is running and try again.";
   }
-  if (r.includes("413") || r.includes("too large") || r.includes("payload too large")) {
-    return "This file is too large to upload. Try a shorter clip — 3 to 5 minutes works best.";
+  if (r.includes("file_too_large") || r.includes("413") || r.includes("payload too large")) {
+    return "That file is too large for the beta. Try an MP3 under 30MB, or trim it to a shorter clip.";
+  }
+  if (r.includes("too large")) {
+    return "That file is too large for the beta. Try an MP3 under 30MB, or trim it to a shorter clip.";
   }
   if (r.includes("empty") || r.includes("too short")) {
     return "The file appears empty or too short. Try a recording with at least a few seconds of audio.";
@@ -3662,6 +3675,13 @@ export default function Home() {
                 ) : null}
               </div>
 
+              {analyzeResult.analysis_window?.was_trimmed ? (
+                <div className="analyze-trim-note" role="note">
+                  <strong>Beta note:</strong> This song was longer than 90 seconds, so we analyzed the first 90 seconds.
+                  Upload a chorus or verse clip later for more targeted results.
+                </div>
+              ) : null}
+
               <div className="analyze-chord-rail-block analyze-chord-rail-block--core">
                 <h2 className="analyze-learning-heading">Simple practice progression</h2>
                 <p className="analyze-learning-lead">
@@ -4399,8 +4419,8 @@ export default function Home() {
                 <p className="analyze-empty-hint">File selected — tap <strong>Analyze</strong> to get your practice roadmap.</p>
               ) : (
                 <>
-                  <p className="analyze-empty-hint">Choose an audio file to get started.</p>
-                  <p className="analyze-empty-sub">Works best with clear recordings — piano, guitar, or simple arrangements. WAV and MP3 supported.</p>
+                  <p className="analyze-empty-hint">You can upload a full song. For beta, we&apos;ll analyze the first 90 seconds.</p>
+                  <p className="analyze-empty-sub">Works best with clear recordings — piano, guitar, or simple arrangements. WAV and MP3 under 30MB supported.</p>
                 </>
               )}
             </div>
