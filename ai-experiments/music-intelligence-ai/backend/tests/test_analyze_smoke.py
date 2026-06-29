@@ -19,6 +19,7 @@ import unittest
 
 from fastapi.testclient import TestClient
 
+from app.core.config import BETA_ANALYSIS_DURATION_SEC
 from app.main import app
 
 from tests.wav_fixtures import n_seconds_silent_wav, one_second_silent_wav
@@ -86,12 +87,13 @@ class TestAnalyzeSmoke(unittest.TestCase):
 		self.assertFalse(aw["was_trimmed"])
 		self.assertIsNone(aw["reason"])
 		self.assertGreater(aw["duration_analyzed"], 0.0)
-		self.assertLess(aw["duration_analyzed"], 90.0)
+		self.assertLess(aw["duration_analyzed"], BETA_ANALYSIS_DURATION_SEC)
 
 	def test_long_file_analysis_window_trimmed(self) -> None:
-		"""A 100-second WAV must be trimmed to ~90 s and report was_trimmed=True."""
+		"""A file longer than BETA_ANALYSIS_DURATION_SEC must be trimmed and report was_trimmed=True."""
 		client = TestClient(app)
-		wav_bytes = n_seconds_silent_wav(100.0)
+		long_sec = BETA_ANALYSIS_DURATION_SEC + 40.0
+		wav_bytes = n_seconds_silent_wav(long_sec)
 		res = client.post("/analyze", files={"file": ("long.wav", wav_bytes, "audio/wav")})
 		self.assertEqual(res.status_code, 200, res.text)
 		data = res.json()
@@ -99,11 +101,9 @@ class TestAnalyzeSmoke(unittest.TestCase):
 		aw = data["analysis_window"]
 		self.assertTrue(aw["was_trimmed"])
 		self.assertEqual(aw["reason"], "beta_duration_limit")
-		# duration_analyzed must be close to the 90-second cap
-		self.assertAlmostEqual(aw["duration_analyzed"], 90.0, delta=1.0)
-		# original_duration available from WAV header probe
+		self.assertAlmostEqual(aw["duration_analyzed"], BETA_ANALYSIS_DURATION_SEC, delta=1.0)
 		self.assertIsNotNone(aw["original_duration"])
-		self.assertGreater(aw["original_duration"], 90.0)
+		self.assertGreater(aw["original_duration"], BETA_ANALYSIS_DURATION_SEC)
 
 	def test_oversized_file_returns_friendly_error(self) -> None:
 		"""A file exceeding the 30MB limit must return 400 with error=file_too_large."""

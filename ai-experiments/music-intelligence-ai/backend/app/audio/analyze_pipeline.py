@@ -66,7 +66,8 @@ from app.models.chords import (
 )
 from app.audio.simplify_progression import compute_simple_practice_progression
 from app.core.config import (
-	BETA_MAX_ANALYSIS_DURATION_SEC,
+	BETA_ANALYSIS_DURATION_SEC,
+	BETA_ANALYSIS_SAMPLE_RATE,
 	BETA_MAX_UPLOAD_SIZE_MB,
 	ENABLE_ML_CHORDS,
 	ENABLE_PITCH_TRANSCRIPTION,
@@ -2736,12 +2737,12 @@ def run_analysis(
 			f"file_too_large: uploaded file exceeds the {BETA_MAX_UPLOAD_SIZE_MB}MB beta limit."
 		)
 
-	y, sr = load_audio_bytes(audio_bytes, sr=ANALYSIS_SR, duration=BETA_MAX_ANALYSIS_DURATION_SEC)
+	y, sr = load_audio_bytes(audio_bytes, sr=ANALYSIS_SR, duration=BETA_ANALYSIS_DURATION_SEC)
 	if y.size < sr * 0.2:
 		raise ValueError("Audio is too short for analysis (need at least ~0.2s).")
 
 	y_duration = float(len(y)) / float(sr)
-	was_trimmed = y_duration >= BETA_MAX_ANALYSIS_DURATION_SEC - 0.5
+	was_trimmed = y_duration >= BETA_ANALYSIS_DURATION_SEC - 0.5
 	original_duration_sec = _probe_audio_duration_sec(audio_bytes) if was_trimmed else y_duration
 	analysis_window: Dict[str, Any] = {
 		"start": 0.0,
@@ -2770,40 +2771,71 @@ def run_analysis_from_path(
 ) -> Dict[str, Any]:
 	"""Analyze audio from a file path — the memory-safe production entry point.
 
-	Unlike run_analysis(bytes), this function never holds the full upload in RAM.
-	librosa.load reads directly from the path:
-	  - WAV/FLAC: soundfile uses a file seek to read only `duration` seconds of samples.
-	  - MP3: audioread decodes progressively and stops at `duration` seconds.
-	Peak in-memory audio footprint = ~8 MB (90 s × 22050 Hz × float32),
-	regardless of how large the original file is.
+	Strategy (in order):
+	1. If ffmpeg is available: pre-trim to BETA_ANALYSIS_DURATION_SEC seconds of mono WAV
+	   at BETA_ANALYSIS_SAMPLE_RATE Hz.  librosa sees only that tiny WAV (~2 MB) and never
+	   touches the full upload.
+	2. Fallback: librosa duration cap — load directly from `audio_path` with duration= set.
+	   Works for WAV/FLAC (soundfile seek) and MP3 (audioread progressive decode).
+
+	Peak in-memory audio footprint with ffmpeg:  ~2 MB (60 s × 16 kHz float32).
+	Peak in-memory audio footprint with fallback: ~6 MB (60 s × 22050 Hz float32).
+	Either path is well within Render free-tier 512 MB.
 	"""
+	from app.audio.ffmpeg_trim import check_ffmpeg_available, ffmpeg_trim_to_wav, _safe_unlink
+
 	log.info(
 		"analyze: loading from temp file path=%s upload_bytes=%d beta_duration_sec=%.0f",
-		audio_path, upload_size_bytes, BETA_MAX_ANALYSIS_DURATION_SEC,
+		audio_path, upload_size_bytes, BETA_ANALYSIS_DURATION_SEC,
 	)
-	y, sr = load_audio_from_path(audio_path, sr=ANALYSIS_SR, duration=BETA_MAX_ANALYSIS_DURATION_SEC)
-	if y.size < sr * 0.2:
-		raise ValueError("Audio is too short for analysis (need at least ~0.2s).")
 
-	y_duration = float(len(y)) / float(sr)
-	was_trimmed = y_duration >= BETA_MAX_ANALYSIS_DURATION_SEC - 0.5
-	original_duration_sec = _probe_audio_duration_from_path(audio_path) if was_trimmed else y_duration
-	analysis_window: Dict[str, Any] = {
-		"start": 0.0,
-		"end": round(y_duration, 4),
-		"duration_analyzed": round(y_duration, 4),
-		"was_trimmed": was_trimmed,
-		"original_duration": round(original_duration_sec, 4) if original_duration_sec is not None else None,
-		"reason": "beta_duration_limit" if was_trimmed else None,
-	}
-	log.info(
-		"analyze: waveform loaded duration=%.2fs was_trimmed=%s original_duration=%s",
-		y_duration, was_trimmed, original_duration_sec,
-	)
-	return _analyze_waveform(
-		y, sr, y_duration, analysis_window,
-		debug=debug,
-		use_source_separation=use_source_separation,
-		engine=engine,
-		upload_size_bytes=upload_size_bytes,
-	)
+	trimmed_path: str | None = None
+	try:
+		if check_ffmpeg_available():
+			try:
+				trimmed_path = ffmpeg_trim_to_wav(
+					audio_path,
+					duration_sec=BETA_ANALYSIS_DURATION_SEC,
+					sample_rate=BETA_ANALYSIS_SAMPLE_RATE,
+				)
+				analysis_src = trimmed_path
+				use_duration_cap = False
+				log.info("analyze: using ffmpeg-trimmed WAV path=%s", trimmed_path)
+			except RuntimeError as exc:
+				log.warning("ffmpeg trim failed (%s); falling back to librosa duration cap", exc)
+				analysis_src = audio_path
+				use_duration_cap = True
+		else:
+			log.info("ffmpeg not available; using librosa duration cap %.0f s", BETA_ANALYSIS_DURATION_SEC)
+			analysis_src = audio_path
+			use_duration_cap = True
+
+		librosa_dur = BETA_ANALYSIS_DURATION_SEC if use_duration_cap else None
+		y, sr = load_audio_from_path(analysis_src, sr=ANALYSIS_SR, duration=librosa_dur)
+		if y.size < sr * 0.2:
+			raise ValueError("Audio is too short for analysis (need at least ~0.2s).")
+
+		y_duration = float(len(y)) / float(sr)
+		was_trimmed = y_duration >= BETA_ANALYSIS_DURATION_SEC - 0.5
+		original_duration_sec = _probe_audio_duration_from_path(audio_path) if was_trimmed else y_duration
+		analysis_window: Dict[str, Any] = {
+			"start": 0.0,
+			"end": round(y_duration, 4),
+			"duration_analyzed": round(y_duration, 4),
+			"was_trimmed": was_trimmed,
+			"original_duration": round(original_duration_sec, 4) if original_duration_sec is not None else None,
+			"reason": "beta_duration_limit" if was_trimmed else None,
+		}
+		log.info(
+			"analyze: waveform loaded duration=%.2fs was_trimmed=%s original_duration=%s ffmpeg=%s",
+			y_duration, was_trimmed, original_duration_sec, not use_duration_cap,
+		)
+		return _analyze_waveform(
+			y, sr, y_duration, analysis_window,
+			debug=debug,
+			use_source_separation=use_source_separation,
+			engine=engine,
+			upload_size_bytes=upload_size_bytes,
+		)
+	finally:
+		_safe_unlink(trimmed_path)

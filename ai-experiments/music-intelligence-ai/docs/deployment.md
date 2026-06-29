@@ -100,20 +100,39 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 
 ---
 
-## Deploy: Backend on Render
+## Deploy: Backend on Render (Docker, recommended)
+
+The backend ships a `backend/Dockerfile` that installs ffmpeg — this is the
+recommended Render deployment because ffmpeg pre-trims uploads to 60 s before
+librosa sees them, keeping peak RAM well under 512 MB.
 
 1. Create a new **Web Service** on [render.com](https://render.com).
 2. Connect your GitHub repo.
 3. Set:
    - **Root Directory:** `backend`
-   - **Runtime:** Python 3
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+   - **Environment:** **Docker** (not Python)
+   - Render auto-detects `backend/Dockerfile` and uses it.
 4. Add environment variables:
    - `CORS_ORIGINS` = `https://your-app.vercel.app,http://localhost:3000`
 5. Deploy. Render gives you a URL like `https://your-backend.onrender.com`.
 
-**Render settings summary:**
+**Render Docker settings summary:**
+
+| Setting | Value |
+|---------|-------|
+| Root Directory | `backend` |
+| Environment | Docker |
+| Dockerfile path | `./Dockerfile` (auto-detected) |
+| Health Check Path | `/health` |
+| Plan | Free tier (512 MB) — ffmpeg keeps audio RAM usage ~2 MB |
+
+> **Note on Render free tier:** The free tier spins down after inactivity. First requests after spin-down take 30–60 seconds. This is expected for beta.
+
+### Alternative: Render Python runtime (no Docker)
+
+If you prefer not to use Docker, you can deploy as a Python service without ffmpeg.
+The backend gracefully falls back to a librosa duration cap for uploads.  Memory
+usage is still safe for WAV/FLAC; large MP3s may use slightly more RAM during decode.
 
 | Setting | Value |
 |---------|-------|
@@ -121,10 +140,6 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 | Runtime | Python 3.11+ |
 | Build Command | `pip install -r requirements.txt` |
 | Start Command | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
-| Health Check Path | `/health` |
-| Plan | Starter (1 CPU, 512MB RAM is a minimum; 1GB+ recommended for librosa) |
-
-> **Note on Render free tier:** The free tier spins down after inactivity. First requests after spin-down take 30–60 seconds. For beta testing, use the Starter paid plan or accept cold starts.
 
 ---
 
@@ -160,26 +175,28 @@ If `CORS_ORIGINS` is not set, only `http://localhost:3000` is allowed. Your depl
 
 ## Beta memory limits and audio trimming
 
-The backend is tuned for Render Starter (512MB RAM) instances.  Two constants in
+The backend is tuned for Render free tier (512 MB RAM).  Three constants in
 `backend/app/core/config.py` control this:
 
 | Constant | Default | Purpose |
 |----------|---------|---------|
-| `BETA_MAX_UPLOAD_SIZE_MB` | 30 | Files larger than this are rejected with a friendly 400 error |
-| `BETA_MAX_ANALYSIS_DURATION_SEC` | 90 | Only the first N seconds of a long file are decoded and analyzed |
+| `BETA_MAX_UPLOAD_SIZE_MB` | 30 | Files larger than this are rejected during upload streaming |
+| `BETA_ANALYSIS_DURATION_SEC` | 60 | Only the first N seconds are analyzed |
+| `BETA_ANALYSIS_SAMPLE_RATE` | 16000 | ffmpeg output rate before librosa resamples to 22050 Hz |
 
-**Why trimming helps memory:**
-librosa decodes audio into a float32 numpy array.  A 5-minute mono track at 22050 Hz is
-~26 MB of RAM before HPSS and chroma processing.  Capping at 90 s keeps the array
-under 8 MB, which fits comfortably in 512 MB alongside librosa's processing buffers.
+**How ffmpeg trimming keeps memory safe:**
+When ffmpeg is available (Docker deployment), uploads are pre-trimmed to a 60-second
+mono 16 kHz WAV before librosa sees them.  Peak audio RAM = 60 × 16000 × 4 bytes ≈ **2 MB**.
+Without ffmpeg (Python-only fallback), librosa loads with `duration=60` from disk —
+peak audio RAM = 60 × 22050 × 4 bytes ≈ **5 MB**.  Both paths are safe under 512 MB.
 
 **Frontend behavior:**
 When `analysis_window.was_trimmed === true` in the API response, the UI shows a note:
-"Beta note: This song was longer than 90 seconds, so we analyzed the first 90 seconds."
+"Beta note: This song was longer than 60 seconds, so we analyzed the first 60 seconds."
 
 **How to increase limits:**
-Upgrade the Render plan to 2 GB RAM, then raise both constants and redeploy.
-Recommended: `BETA_MAX_ANALYSIS_DURATION_SEC = 300` (5 min) on 2 GB, or 600 on 4 GB.
+Upgrade the Render plan to 2 GB RAM, then raise `BETA_ANALYSIS_DURATION_SEC` and redeploy.
+Recommended: `BETA_ANALYSIS_DURATION_SEC = 300` (5 min) on 2 GB.
 
 **Upload format guidance for beta testers:**
 - Recommended: MP3 under 30 MB (roughly 30 minutes at 128 kbps)
