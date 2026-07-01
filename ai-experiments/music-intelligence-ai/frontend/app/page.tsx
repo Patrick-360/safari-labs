@@ -38,6 +38,10 @@ import {
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
 
+// Beta: trim in the browser so Render never receives a full song.
+const BETA_CLIENT_ANALYSIS_DURATION_SEC = 30;
+const BETA_CLIENT_SAMPLE_RATE = 11025; // ~1.9 MB WAV for 30 s mono 16-bit
+
 /** Verbose `[live]` console logs — optional via env or <code>?liveDebug=1</code>. */
 const LIVE_MIC_CONSOLE = process.env.NEXT_PUBLIC_LIVE_MIC_DEBUG === "1";
 
@@ -842,6 +846,76 @@ function readStrengthLabel(value: number): string {
 }
 
 /** Map raw error strings from the analyze fetch to user-friendly messages. */
+function encodeWavBlob(samples: Float32Array, sampleRate: number): Blob {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * (bitsPerSample / 8);
+  const dataSize = samples.length * 2;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const v = new DataView(buf);
+  const ws = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF");  v.setUint32(4, 36 + dataSize, true);
+  ws(8, "WAVE"); ws(12, "fmt ");
+  v.setUint32(16, 16, true);    // PCM chunk size
+  v.setUint16(20, 1, true);     // PCM format
+  v.setUint16(22, numChannels, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, byteRate, true);
+  v.setUint16(32, numChannels * (bitsPerSample / 8), true);
+  v.setUint16(34, bitsPerSample, true);
+  ws(36, "data"); v.setUint32(40, dataSize, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    off += 2;
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+async function trimAudioClientSide(
+  file: File,
+  durationSec: number,
+  targetSampleRate: number,
+): Promise<{ blob: Blob; wasTrimmed: boolean }> {
+  const arrayBuf = await file.arrayBuffer();
+  const AudioCtxClass: typeof AudioContext =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  let tmpCtx: AudioContext | undefined;
+  let decoded: AudioBuffer;
+  try {
+    tmpCtx = new AudioCtxClass();
+    decoded = await tmpCtx.decodeAudioData(arrayBuf);
+  } finally {
+    tmpCtx?.close().catch(() => {});
+  }
+  if (decoded.length === 0) throw new Error("audio_decode_failed: decoded audio is empty");
+
+  // Trim to durationSec (or keep all if shorter)
+  const srcFrames = Math.min(decoded.length, Math.floor(durationSec * decoded.sampleRate));
+  const wasTrimmed = srcFrames < decoded.length;
+  const actualSec = srcFrames / decoded.sampleRate;
+  const outputFrames = Math.max(1, Math.floor(actualSec * targetSampleRate));
+
+  // Downmix all channels to mono, then resample via OfflineAudioContext
+  const offline = new OfflineAudioContext(1, outputFrames, targetSampleRate);
+  const monoBuf = offline.createBuffer(1, srcFrames, decoded.sampleRate);
+  const dst = monoBuf.getChannelData(0);
+  const nCh = decoded.numberOfChannels;
+  for (let i = 0; i < srcFrames; i++) {
+    let sum = 0;
+    for (let c = 0; c < nCh; c++) sum += decoded.getChannelData(c)[i];
+    dst[i] = sum / nCh;
+  }
+  const srcNode = offline.createBufferSource();
+  srcNode.buffer = monoBuf;
+  srcNode.connect(offline.destination);
+  srcNode.start(0);
+  const rendered = await offline.startRendering();
+  return { blob: encodeWavBlob(rendered.getChannelData(0), targetSampleRate), wasTrimmed };
+}
+
 function friendlyAnalyzeError(raw: string): string {
   const r = raw.toLowerCase();
   if (r.includes("failed to fetch") || r.includes("networkerror") || r.includes("network request failed") || r.includes("load failed")) {
@@ -874,8 +948,8 @@ function friendlyAnalyzeError(raw: string): string {
 /** Illustrative stages while POST /analyze runs — not timed to real server progress. */
 const ANALYZE_STAGE_MESSAGES = [
   {
-    title: "Loading audio",
-    detail: "Sending your track for analysis.",
+    title: "Preparing audio",
+    detail: "Trimming and encoding in your browser, then uploading.",
   },
   {
     title: "Rhythm & tempo",
@@ -1110,6 +1184,7 @@ export default function Home() {
   const [analyzeChordEngine, setAnalyzeChordEngine] = useState<AnalyzeChordEngineId>("theory");
   const [analyzeUseSourceSeparation, setAnalyzeUseSourceSeparation] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [analyzeClientTrimmed, setAnalyzeClientTrimmed] = useState(false);
   const [analyzeAudioUrl, setAnalyzeAudioUrl] = useState<string | null>(null);
   const [analyzePlaybackTime, setAnalyzePlaybackTime] = useState(0);
   const [analyzeMediaDuration, setAnalyzeMediaDuration] = useState(0);
@@ -2346,6 +2421,7 @@ export default function Home() {
     setAnalyzeFileName(f?.name ?? null);
     setAnalyzeResult(null);
     setAnalyzeError(null);
+    setAnalyzeClientTrimmed(false);
     setLoopSectionEnabled(false);
     setLoopSectionIndex(null);
     setAnalyzePlaybackRate(1);
@@ -2356,9 +2432,29 @@ export default function Home() {
     if (!analyzeFile) return;
     setAnalyzeLoading(true);
     setAnalyzeError(null);
+    setAnalyzeClientTrimmed(false);
     try {
+      // Trim + encode in the browser so the backend never receives the full file.
+      let uploadBlob: Blob;
+      let wasTrimmed = false;
+      try {
+        const result = await trimAudioClientSide(
+          analyzeFile,
+          BETA_CLIENT_ANALYSIS_DURATION_SEC,
+          BETA_CLIENT_SAMPLE_RATE,
+        );
+        uploadBlob = result.blob;
+        wasTrimmed = result.wasTrimmed;
+      } catch {
+        setAnalyzeError(
+          "We couldn't prepare that audio file in your browser. Try MP3 or WAV, or try a smaller file.",
+        );
+        return;
+      }
+      const base = analyzeFile.name.replace(/\.[^.]+$/, "");
+      const uploadName = `${base}.beta-30s.wav`;
       const fd = new FormData();
-      fd.append("file", analyzeFile);
+      fd.append("file", uploadBlob, uploadName);
       const params = new URLSearchParams();
       params.set("debug", analyzeQueryDebug ? "true" : "false");
       params.set("engine", analyzeChordEngine);
@@ -2373,6 +2469,7 @@ export default function Home() {
       }
       const data = (await res.json()) as AnalyzeApiResponse;
       setAnalyzeResult(data);
+      setAnalyzeClientTrimmed(wasTrimmed);
       setAnalyzeFileName(analyzeFile.name);
       setLoopSectionEnabled(false);
       setLoopSectionIndex(null);
@@ -3678,10 +3775,9 @@ export default function Home() {
                 ) : null}
               </div>
 
-              {analyzeResult.analysis_window?.was_trimmed ? (
+              {analyzeClientTrimmed ? (
                 <div className="analyze-trim-note" role="note">
-                  <strong>Beta note:</strong> This song was longer than 60 seconds, so we analyzed the first 60 seconds.
-                  Upload a chorus or verse clip later for more targeted results.
+                  <strong>Beta note:</strong> We analyzed the first 30 seconds to keep processing fast.
                 </div>
               ) : null}
 
@@ -4422,7 +4518,7 @@ export default function Home() {
                 <p className="analyze-empty-hint">File selected — tap <strong>Analyze</strong> to get your practice roadmap.</p>
               ) : (
                 <>
-                  <p className="analyze-empty-hint">You can upload a full song. For beta, we&apos;ll analyze the first 60 seconds.</p>
+                  <p className="analyze-empty-hint">You can upload a full song. For beta, we&apos;ll prepare and analyze the first 30 seconds.</p>
                   <p className="analyze-empty-sub">Works best with clear recordings — piano, guitar, or simple arrangements. WAV and MP3 under 30MB supported.</p>
                 </>
               )}
