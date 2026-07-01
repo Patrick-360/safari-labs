@@ -850,14 +850,14 @@ function encodeWavBlob(samples: Float32Array, sampleRate: number): Blob {
   const numChannels = 1;
   const bitsPerSample = 16;
   const byteRate = sampleRate * (bitsPerSample / 8);
-  const dataSize = samples.length * 2;
+  const dataSize = samples.length * 2; // 16-bit = 2 bytes per sample
   const buf = new ArrayBuffer(44 + dataSize);
   const v = new DataView(buf);
   const ws = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
   ws(0, "RIFF");  v.setUint32(4, 36 + dataSize, true);
   ws(8, "WAVE"); ws(12, "fmt ");
-  v.setUint32(16, 16, true);    // PCM chunk size
-  v.setUint16(20, 1, true);     // PCM format
+  v.setUint32(16, 16, true);                            // PCM chunk size
+  v.setUint16(20, 1, true);                             // PCM format
   v.setUint16(22, numChannels, true);
   v.setUint32(24, sampleRate, true);
   v.setUint32(28, byteRate, true);
@@ -871,6 +871,25 @@ function encodeWavBlob(samples: Float32Array, sampleRate: number): Blob {
     off += 2;
   }
   return new Blob([buf], { type: "audio/wav" });
+}
+
+// Linear-interpolation downsampler — pure JS so output size is exact and deterministic.
+// Do NOT use OfflineAudioContext for resampling: browsers silently normalise its sampleRate
+// (Chrome, Edge ≥ ~M70 floor at 22050), causing the output buffer to be 2–4× too large.
+function linearResample(src: Float32Array, srcLen: number, dstLen: number): Float32Array {
+  if (dstLen <= 0) return new Float32Array(0);
+  if (srcLen === dstLen) return src.slice(0, srcLen);
+  const dst = new Float32Array(dstLen);
+  const ratio = srcLen / dstLen;
+  for (let i = 0; i < dstLen; i++) {
+    const pos = i * ratio;
+    const lo = Math.floor(pos);
+    const frac = pos - lo;
+    const a = src[lo] ?? 0;
+    const b = lo + 1 < srcLen ? src[lo + 1] : a;
+    dst[i] = a + frac * (b - a);
+  }
+  return dst;
 }
 
 async function trimAudioClientSide(
@@ -890,30 +909,44 @@ async function trimAudioClientSide(
   } finally {
     tmpCtx?.close().catch(() => {});
   }
-  if (decoded.length === 0) throw new Error("audio_decode_failed: decoded audio is empty");
+  if (!decoded || decoded.length === 0) throw new Error("audio_decode_failed: decoded audio is empty");
 
-  // Trim to durationSec (or keep all if shorter)
-  const srcFrames = Math.min(decoded.length, Math.floor(durationSec * decoded.sampleRate));
-  const wasTrimmed = srcFrames < decoded.length;
-  const actualSec = srcFrames / decoded.sampleRate;
-  const outputFrames = Math.max(1, Math.floor(actualSec * targetSampleRate));
-
-  // Downmix all channels to mono, then resample via OfflineAudioContext
-  const offline = new OfflineAudioContext(1, outputFrames, targetSampleRate);
-  const monoBuf = offline.createBuffer(1, srcFrames, decoded.sampleRate);
-  const dst = monoBuf.getChannelData(0);
+  const srcSR = decoded.sampleRate;
   const nCh = decoded.numberOfChannels;
+
+  // Trim: extract first durationSec seconds (or full file if shorter)
+  const srcFrames = Math.min(decoded.length, Math.floor(durationSec * srcSR));
+  const wasTrimmed = srcFrames < decoded.length;
+
+  // Downmix all channels to mono
+  const mono = new Float32Array(srcFrames);
   for (let i = 0; i < srcFrames; i++) {
     let sum = 0;
     for (let c = 0; c < nCh; c++) sum += decoded.getChannelData(c)[i];
-    dst[i] = sum / nCh;
+    mono[i] = sum / nCh;
   }
-  const srcNode = offline.createBufferSource();
-  srcNode.buffer = monoBuf;
-  srcNode.connect(offline.destination);
-  srcNode.start(0);
-  const rendered = await offline.startRendering();
-  return { blob: encodeWavBlob(rendered.getChannelData(0), targetSampleRate), wasTrimmed };
+
+  // Resample to targetSampleRate using linear interpolation (no OfflineAudioContext —
+  // browser normalisation causes unpredictable output sizes)
+  const dstFrames = Math.max(1, Math.floor(srcFrames * targetSampleRate / srcSR));
+  const resampled = linearResample(mono, srcFrames, dstFrames);
+  const blob = encodeWavBlob(resampled, targetSampleRate);
+
+  console.log("[beta-trim]", {
+    original_sample_rate: srcSR,
+    original_channels: nCh,
+    original_frames: decoded.length,
+    original_duration_sec: (decoded.length / srcSR).toFixed(2),
+    src_frames_used: srcFrames,
+    was_trimmed: wasTrimmed,
+    beta_duration_sec: (dstFrames / targetSampleRate).toFixed(2),
+    beta_sample_rate: targetSampleRate,
+    beta_channels: 1,
+    beta_frames: dstFrames,
+    beta_wav_bytes: blob.size,
+  });
+
+  return { blob, wasTrimmed };
 }
 
 function friendlyAnalyzeError(raw: string): string {
@@ -1185,6 +1218,7 @@ export default function Home() {
   const [analyzeUseSourceSeparation, setAnalyzeUseSourceSeparation] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
   const [analyzeClientTrimmed, setAnalyzeClientTrimmed] = useState(false);
+  const [analyzeClipInfo, setAnalyzeClipInfo] = useState<string | null>(null);
   const [analyzeAudioUrl, setAnalyzeAudioUrl] = useState<string | null>(null);
   const [analyzePlaybackTime, setAnalyzePlaybackTime] = useState(0);
   const [analyzeMediaDuration, setAnalyzeMediaDuration] = useState(0);
@@ -2422,6 +2456,7 @@ export default function Home() {
     setAnalyzeResult(null);
     setAnalyzeError(null);
     setAnalyzeClientTrimmed(false);
+    setAnalyzeClipInfo(null);
     setLoopSectionEnabled(false);
     setLoopSectionIndex(null);
     setAnalyzePlaybackRate(1);
@@ -2433,6 +2468,7 @@ export default function Home() {
     setAnalyzeLoading(true);
     setAnalyzeError(null);
     setAnalyzeClientTrimmed(false);
+    setAnalyzeClipInfo(null);
     try {
       // Trim + encode in the browser so the backend never receives the full file.
       let uploadBlob: Blob;
@@ -2451,8 +2487,27 @@ export default function Home() {
         );
         return;
       }
+      // Guard: if the encoded WAV is still too large, abort before uploading.
+      if (uploadBlob.size > 1_500_000) {
+        setAnalyzeError(
+          "Beta clip is still too large. Try a smaller file or refresh and try again.",
+        );
+        return;
+      }
       const base = analyzeFile.name.replace(/\.[^.]+$/, "");
-      const uploadName = `${base}.beta-30s.wav`;
+      const uploadName = `${base}.beta-30s-11025hz.wav`;
+      const clipMb = (uploadBlob.size / 1_048_576).toFixed(2);
+      const clipInfo = `Uploading beta clip: ${clipMb} MB, 30s mono ${BETA_CLIENT_SAMPLE_RATE} Hz`;
+      setAnalyzeClipInfo(clipInfo);
+      console.log("[beta-upload]", {
+        original_file_name: analyzeFile.name,
+        original_file_size_bytes: analyzeFile.size,
+        beta_filename: uploadName,
+        beta_wav_size_bytes: uploadBlob.size,
+        beta_duration_sec: BETA_CLIENT_ANALYSIS_DURATION_SEC,
+        beta_sample_rate: BETA_CLIENT_SAMPLE_RATE,
+        beta_channels: 1,
+      });
       const fd = new FormData();
       fd.append("file", uploadBlob, uploadName);
       const params = new URLSearchParams();
@@ -3687,8 +3742,11 @@ export default function Home() {
               <div className="analyze-spinner" aria-hidden />
               <div className="analyze-processing-body">
                 <strong className="analyze-processing-title">Analyzing your track</strong>
+                {analyzeClipInfo ? (
+                  <p className="analyze-clip-info muted-hint">{analyzeClipInfo}</p>
+                ) : null}
                 <p className="analyze-processing-detail">
-                  Longer files take longer. The list below is a rough guide — the server may finish steps in a different order.
+                  The list below is a rough guide — the server may finish steps in a different order.
                 </p>
                 <ol className="analyze-stage-list" aria-label="Analysis stages (illustrative)">
                   {ANALYZE_STAGE_MESSAGES.map((step, i) => (
