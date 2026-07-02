@@ -39,7 +39,7 @@ const API_BASE =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
 
 // Beta: trim in the browser so Render never receives a full song.
-const BETA_CLIENT_ANALYSIS_DURATION_SEC = 30;
+const BETA_CLIENT_ANALYSIS_DURATION_SEC = 60;
 const BETA_CLIENT_SAMPLE_RATE = 11025; // ~1.9 MB WAV for 30 s mono 16-bit
 
 /** Verbose `[live]` console logs — optional via env or <code>?liveDebug=1</code>. */
@@ -2495,9 +2495,9 @@ export default function Home() {
         return;
       }
       const base = analyzeFile.name.replace(/\.[^.]+$/, "");
-      const uploadName = `${base}.beta-30s-11025hz.wav`;
+      const uploadName = `${base}.beta-60s-11025hz.wav`;
       const clipMb = (uploadBlob.size / 1_048_576).toFixed(2);
-      const clipInfo = `Uploading beta clip: ${clipMb} MB, 30s mono ${BETA_CLIENT_SAMPLE_RATE} Hz`;
+      const clipInfo = `Uploading beta clip: ${clipMb} MB, 60s mono ${BETA_CLIENT_SAMPLE_RATE} Hz`;
       setAnalyzeClipInfo(clipInfo);
       console.log("[beta-upload]", {
         original_file_name: analyzeFile.name,
@@ -3835,7 +3835,7 @@ export default function Home() {
 
               {analyzeClientTrimmed ? (
                 <div className="analyze-trim-note" role="note">
-                  <strong>Beta note:</strong> We analyzed the first 30 seconds to keep processing fast.
+                  <strong>Beta note:</strong> We analyzed the first 60 seconds to keep processing fast.
                 </div>
               ) : null}
 
@@ -4576,7 +4576,7 @@ export default function Home() {
                 <p className="analyze-empty-hint">File selected — tap <strong>Analyze</strong> to get your practice roadmap.</p>
               ) : (
                 <>
-                  <p className="analyze-empty-hint">You can upload a full song. For beta, we&apos;ll prepare and analyze the first 30 seconds.</p>
+                  <p className="analyze-empty-hint">You can upload a full song. For beta, we&apos;ll prepare and analyze the first 60 seconds.</p>
                   <p className="analyze-empty-sub">Works best with clear recordings — piano, guitar, or simple arrangements. WAV and MP3 under 30MB supported.</p>
                 </>
               )}
